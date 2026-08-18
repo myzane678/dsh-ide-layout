@@ -3,7 +3,7 @@
  *  region) so sidebar and tree form one left column; the workbench portal
  *  hosts only the editor. */
 
-import { useEffect, useState, createElement, type JSX } from 'react'
+import { useEffect, useState, createElement, type JSX, type CSSProperties } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import type { IdeState, ListenerStore } from './store.ts'
 import { FileTree } from './components/FileTree.tsx'
@@ -44,35 +44,73 @@ export interface IdeMountApi {
 
 /** The sidebar file tree: follows the ide root (workspace/session).
  *  v13: 顶部「文件 | Git」视图切换；Git 面板复用同一块区域。
- *  v15: 加「问题」视图（LSP 诊断聚合）。 */
+ *  v15: 加「问题」视图（LSP 诊断聚合）。
+ *  v17: 改为文件树常驻主视图 + 右上角小图标切换 Git/问题（方案 B，大确定）：
+ *  左侧标题显示当前视图名，点标题或激活图标回到文件树；问题图标带诊断计数角标。 */
 function SidebarTree({ api }: { api: IdeMountApi }): JSX.Element {
   const [, force] = useState(0)
   useEffect(() => api.ide.subscribe(() => force((n) => n + 1)), [api.ide])
   const state = api.ide.getSnapshot()
   const [view, setView] = useState<'files' | 'git' | 'problems'>('files')
+  // 诊断计数角标：聚合所有打开文件的 LSP 诊断（错误+警告）。
+  const problemCount = Object.values(state.diagnostics).reduce((total, list) => total + list.length, 0)
+  const viewTitle = view === 'files' ? '资源管理器' : view === 'git' ? '源代码管理' : '问题'
+  const toggle = (key: 'git' | 'problems'): void => setView((prev) => (prev === key ? 'files' : key))
+  const iconButton: CSSProperties = {
+    width: 24, height: 24, display: 'flex', alignItems: 'center', justifyContent: 'center',
+    border: 'none', background: 'transparent', cursor: 'pointer', fontSize: 13,
+    padding: 0, borderRadius: 4, fontFamily: 'inherit',
+  }
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
+      {/* 标题行：当前视图名 + Git/问题 小图标切换 */}
       <div style={{
-        display: 'flex', flexShrink: 0,
+        display: 'flex', alignItems: 'center', gap: 4, padding: '4px 6px', flexShrink: 0,
         borderBottom: '1px solid var(--ide-border,#e5e6eb)',
         background: 'var(--ide-tabbar, rgba(127,127,127,0.06))',
       }}>
-        {(['files', 'git', 'problems'] as const).map((key) => (
-          <button
-            key={key}
-            type="button"
-            onClick={() => setView(key)}
-            title={key === 'problems' ? '问题面板（LSP 诊断）' : undefined}
-            style={{
-              flex: 1, padding: '5px 0', fontSize: 12, cursor: 'pointer',
-              border: 'none', borderBottom: view === key ? '2px solid var(--ide-accent,#4f8cff)' : '2px solid transparent',
-              background: 'transparent', color: view === key ? 'inherit' : '#6b7280',
-              fontFamily: 'inherit', whiteSpace: 'nowrap',
-            }}
-          >
-            {key === 'files' ? '📁 文件' : key === 'git' ? '🛠 Git' : '⚠️ 问题'}
-          </button>
-        ))}
+        <span
+          title="回到文件树"
+          onClick={() => setView('files')}
+          style={{
+            flex: 1, minWidth: 0, fontSize: 11, fontWeight: 600, cursor: 'pointer',
+            color: 'var(--ide-muted,#6b7280)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          }}
+        >
+          {viewTitle}
+        </span>
+        <button
+          type="button"
+          onClick={() => toggle('problems')}
+          title={problemCount > 0 ? `问题面板（${problemCount} 项诊断）` : '问题面板'}
+          style={{
+            ...iconButton, opacity: view === 'problems' ? 1 : 0.55,
+            background: view === 'problems' ? 'var(--ide-hover, rgba(127,127,127,0.12))' : 'transparent',
+            position: 'relative',
+          }}
+        >
+          ⚠️
+          {problemCount > 0 && (
+            <span style={{
+              position: 'absolute', top: -2, right: -2, minWidth: 14, height: 14, padding: '0 3px',
+              background: '#dc2626', color: '#fff', fontSize: 9, lineHeight: '14px', textAlign: 'center',
+              borderRadius: 8, boxSizing: 'border-box',
+            }}>
+              {problemCount > 99 ? '99+' : problemCount}
+            </span>
+          )}
+        </button>
+        <button
+          type="button"
+          onClick={() => toggle('git')}
+          title="Git 面板"
+          style={{
+            ...iconButton, opacity: view === 'git' ? 1 : 0.55,
+            background: view === 'git' ? 'var(--ide-hover, rgba(127,127,127,0.12))' : 'transparent',
+          }}
+        >
+          🛠
+        </button>
       </div>
       <div style={{ flex: 1, minHeight: 0 }}>
         {view === 'files' && <FileTree root={state.root} treeTick={state.treeTick} onOpenFile={api.openFile} />}
