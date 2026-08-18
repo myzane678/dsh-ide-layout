@@ -1,0 +1,13 @@
+# 依赖
+node_modules/
+
+# 构建产物
+lib/
+*.tsbuildinfo
+
+# 本地交接/记录文件
+memory.md
+
+# 系统文件
+.DS_Store
+Thumbs.db

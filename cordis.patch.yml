@@ -1,0 +1,7 @@
+# dsh-ide-layout bundle patch: registers the dual-face plugin row.
+# Node half (exports ".") runs in the host process (workspace-gated fs
+# service + /dsh-ide routes); the dsh.client declaration makes the browser
+# half (exports "./client") load in the web GUI.
+- insert:
+    - id: ui-dsh-ide-layout
+      name: 'dsh-ide-layout'
