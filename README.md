@@ -62,6 +62,22 @@ src/
 
 ## 安装与构建
 
+### 一键安装（DSH 插件 CLI）
+
+在 DSH 中通过插件命令从 GitHub 安装，安装时自动执行 `prepare` 构建（无需手动 build）：
+
+```bash
+dsh plugin --profile desktop add "dsh-ide-layout@git+https://github.com/myzane678/dsh-ide-layout.git"
+```
+
+安装后重启 DSH（或刷新 GUI 页面）生效。之后更新插件只需在 profile 目录执行：
+
+```bash
+pnpm update dsh-ide-layout
+```
+
+### 本地开发构建
+
 ```bash
 pnpm install
 pnpm build    # tsc -b && tsdown
