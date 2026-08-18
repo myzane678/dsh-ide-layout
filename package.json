@@ -31,6 +31,7 @@
   },
   "scripts": {
     "build": "tsc -b && tsdown",
+    "prepare": "pnpm build",
     "watch": "tsdown --watch",
     "typecheck": "tsc -b --pretty false"
   },
