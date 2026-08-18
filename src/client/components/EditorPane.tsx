@@ -17,6 +17,17 @@ import { markdown } from '@codemirror/lang-markdown'
 import { python } from '@codemirror/lang-python'
 import { html } from '@codemirror/lang-html'
 import { css } from '@codemirror/lang-css'
+import { yaml } from '@codemirror/lang-yaml'
+import { xml } from '@codemirror/lang-xml'
+import { sql } from '@codemirror/lang-sql'
+import { java } from '@codemirror/lang-java'
+import { cpp } from '@codemirror/lang-cpp'
+import { rust } from '@codemirror/lang-rust'
+import { go } from '@codemirror/lang-go'
+import { php } from '@codemirror/lang-php'
+import { vue } from '@codemirror/lang-vue'
+import { sass } from '@codemirror/lang-sass'
+import { less } from '@codemirror/lang-less'
 import { apiRead, apiRun, apiWrite } from '../api.ts'
 import type { RunResult } from '../api.ts'
 import type { EditorTab } from '../store.ts'
@@ -54,9 +65,20 @@ function languageFor(path: string): Extension {
     case 'tsx': case 'mts': case 'cts': return javascript({ typescript: true, jsx: true })
     case 'json': case 'jsonc': case 'map': return json()
     case 'md': case 'markdown': return markdown()
-    case 'py': return python()
+    case 'py': case 'pyw': return python()
     case 'html': case 'htm': return html()
     case 'css': return css()
+    case 'yaml': case 'yml': return yaml()
+    case 'xml': case 'svg': case 'xsl': case 'plist': return xml()
+    case 'sql': case 'mysql': case 'pgsql': return sql()
+    case 'java': return java()
+    case 'c': case 'h': case 'cc': case 'cpp': case 'cxx': case 'hpp': case 'hh': return cpp()
+    case 'rs': return rust()
+    case 'go': return go()
+    case 'php': return php()
+    case 'vue': return vue()
+    case 'scss': return sass()
+    case 'less': return less()
     default: return []
   }
 }
@@ -75,6 +97,12 @@ const ideHighlight = HighlightStyle.define([
   { tag: [t.propertyName], color: 'var(--ide-hl-property, #0070C1)' },
   { tag: [t.definition(t.variableName)], color: 'var(--ide-hl-variable, #001080)' },
   { tag: t.invalid, color: 'var(--ide-hl-invalid, #FF0000)' },
+  // Markdown：标题加粗深蓝 / 强调斜体 / 链接下划线蓝 / 引用与行内代码 / 删除线灰。
+  { tag: [t.heading, t.heading1, t.heading2, t.heading3, t.heading4, t.heading5, t.heading6], color: 'var(--ide-hl-heading, #0000FF)', fontWeight: '600' },
+  { tag: [t.emphasis, t.strong], color: 'var(--ide-hl-emphasis, #795E26)', fontStyle: 'italic' },
+  { tag: [t.link, t.url], color: 'var(--ide-hl-link, #0070C1)', textDecoration: 'underline' },
+  { tag: [t.quote, t.monospace], color: 'var(--ide-hl-quote, #008000)' },
+  { tag: t.strikethrough, color: 'var(--ide-hl-strikethrough, #9ca3af)' },
 ])
 
 interface CodeMirrorPaneProps {
