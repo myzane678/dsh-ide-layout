@@ -56,16 +56,20 @@ function SidebarTree({ api }: { api: IdeMountApi }): JSX.Element {
   const problemCount = Object.values(state.diagnostics).reduce((total, list) => total + list.length, 0)
   const viewTitle = view === 'files' ? '资源管理器' : view === 'git' ? '源代码管理' : '问题'
   const toggle = (key: 'git' | 'problems'): void => setView((prev) => (prev === key ? 'files' : key))
-  const iconButton: CSSProperties = {
-    width: 24, height: 24, display: 'flex', alignItems: 'center', justifyContent: 'center',
-    border: 'none', background: 'transparent', cursor: 'pointer', fontSize: 13,
-    padding: 0, borderRadius: 4, fontFamily: 'inherit',
-  }
+  /** 带文字的紧凑切换按钮：比纯图标明显，又不回到三个等宽 tab。 */
+  const viewButton = (active: boolean): CSSProperties => ({
+    display: 'flex', alignItems: 'center', gap: 3, height: 22, padding: '0 7px',
+    border: `1px solid ${active ? 'var(--ide-accent,#4f8cff)' : 'var(--ide-border,#e5e6eb)'}`,
+    background: active ? 'var(--ide-hover, rgba(127,127,127,0.12))' : 'transparent',
+    color: active ? 'inherit' : 'var(--ide-muted,#6b7280)',
+    borderRadius: 4, cursor: 'pointer', fontSize: 11, fontFamily: 'inherit',
+    whiteSpace: 'nowrap', position: 'relative',
+  })
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
-      {/* 标题行：当前视图名 + Git/问题 小图标切换 */}
+      {/* 标题行：当前视图名 + Git/问题 切换按钮 */}
       <div style={{
-        display: 'flex', alignItems: 'center', gap: 4, padding: '4px 6px', flexShrink: 0,
+        display: 'flex', alignItems: 'center', gap: 6, padding: '4px 6px', flexShrink: 0,
         borderBottom: '1px solid var(--ide-border,#e5e6eb)',
         background: 'var(--ide-tabbar, rgba(127,127,127,0.06))',
       }}>
@@ -83,16 +87,12 @@ function SidebarTree({ api }: { api: IdeMountApi }): JSX.Element {
           type="button"
           onClick={() => toggle('problems')}
           title={problemCount > 0 ? `问题面板（${problemCount} 项诊断）` : '问题面板'}
-          style={{
-            ...iconButton, opacity: view === 'problems' ? 1 : 0.55,
-            background: view === 'problems' ? 'var(--ide-hover, rgba(127,127,127,0.12))' : 'transparent',
-            position: 'relative',
-          }}
+          style={viewButton(view === 'problems')}
         >
-          ⚠️
+          ⚠️ 问题
           {problemCount > 0 && (
             <span style={{
-              position: 'absolute', top: -2, right: -2, minWidth: 14, height: 14, padding: '0 3px',
+              minWidth: 14, height: 14, padding: '0 3px',
               background: '#dc2626', color: '#fff', fontSize: 9, lineHeight: '14px', textAlign: 'center',
               borderRadius: 8, boxSizing: 'border-box',
             }}>
@@ -104,12 +104,9 @@ function SidebarTree({ api }: { api: IdeMountApi }): JSX.Element {
           type="button"
           onClick={() => toggle('git')}
           title="Git 面板"
-          style={{
-            ...iconButton, opacity: view === 'git' ? 1 : 0.55,
-            background: view === 'git' ? 'var(--ide-hover, rgba(127,127,127,0.12))' : 'transparent',
-          }}
+          style={viewButton(view === 'git')}
         >
-          🛠
+          🛠 Git
         </button>
       </div>
       <div style={{ flex: 1, minHeight: 0 }}>
