@@ -7,11 +7,12 @@ DSH（DeepSeek Harness）Web GUI 的 IDE 布局插件：左侧工作区文件树
 ## 功能特性
 
 ### 编辑器（CodeMirror 6）
-- 语法高亮：JavaScript / TypeScript / Python / HTML / CSS / Markdown / JSON
+- 语法高亮：JavaScript / TypeScript / JSX / JSON / Markdown / Python / HTML / CSS / YAML / XML / SQL / Java / C/C++ / Rust / Go / PHP / Vue / SCSS / LESS / TOML
 - 行号、代码折叠、状态栏（语言 / 行列 / 诊断数）
 - 自动补全（LSP）、诊断波浪线、悬停提示
 - F12 / Ctrl+点击 跳转定义、F2 重命名、Shift+Alt+F 格式化
 - 右键快速修复、Tab 接受补全
+- 保存：Ctrl+S 快捷键 + tab 栏「💾 保存」按钮（有未保存更改时可用，状态栏反馈）
 
 ### LSP（语言服务器协议）
 - TypeScript：`typescript-language-server` 5.3.0
@@ -20,10 +21,11 @@ DSH（DeepSeek Harness）Web GUI 的 IDE 布局插件：左侧工作区文件树
 - ⚠️ Electron 宿主必须设置 `ELECTRON_RUN_AS_NODE=1`
 
 ### 文件树
-- 左侧栏 flex 流嵌入布局（不覆盖、不遮挡）
+- 左侧栏 flex 流嵌入布局（不覆盖、不遮挡），常驻主视图
 - 目录懒加载、刷新不闪烁
 - 右键菜单：新建 / 重命名 / 删除 / 复制路径 / 资源管理器显示
 - 顶部拖拽手柄调整高度（localStorage 记忆）
+- 右上角小图标切换 Git / 问题视图（问题图标带诊断计数角标）
 
 ### 终端
 - xterm 5.5 + node-pty，每个 root 一个 shell
@@ -31,8 +33,9 @@ DSH（DeepSeek Harness）Web GUI 的 IDE 布局插件：左侧工作区文件树
 - 30s 重连宽限
 
 ### Git 面板
-- status / diff / stage / unstage / commit / discard / log
-- 侧边栏「文件 | Git | 问题」Tab 切换
+- status / diff / stage / unstage / commit / discard / log + 提交历史 diff
+- **嵌套仓库发现**：工作区根不是 Git 仓库时，自动扫描子目录中的仓库并在下拉框中选择（如多插件仓库 `dsh-plugins` 下的各插件）
+- 仓库选择器完整显示仓库名，分支名超长自动省略
 
 ### 问题面板
 - 聚合所有 LSP 诊断，按文件分组 + 行号排序 + 严重度彩色标记，点击跳转
