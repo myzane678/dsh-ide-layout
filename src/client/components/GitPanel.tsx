@@ -198,7 +198,10 @@ export function GitPanel({ root }: GitPanelProps): JSX.Element {
         display: 'flex', alignItems: 'center', gap: 6, padding: '6px 10px',
         borderBottom: '1px solid var(--ide-border,#e5e6eb)', flexShrink: 0,
       }}>
-        <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--ide-muted,#6b7280)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+        <span style={{
+          flex: '1 1 auto', minWidth: 0, fontSize: 12, fontWeight: 600,
+          color: 'var(--ide-muted,#6b7280)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+        }}>
           {status === null ? 'Git' : status.isRepo ? `分支 ${status.branch ?? 'HEAD'}` : '非 Git 仓库'}
         </span>
         {repos.length > 0 && (
@@ -206,17 +209,18 @@ export function GitPanel({ root }: GitPanelProps): JSX.Element {
             value={gitRoot}
             onChange={(event) => { activeRepoRef.current = event.target.value; setActiveRepo(event.target.value) }}
             style={{
-              fontSize: 11, maxWidth: 150, background: 'var(--dsw-alias-bg-base,#ffffff)',
+              fontSize: 11, maxWidth: 160, minWidth: 0, flexShrink: 1,
+              background: 'var(--dsw-alias-bg-base,#ffffff)',
               color: 'inherit', border: '1px solid var(--ide-border,#e5e6eb)', borderRadius: 3, padding: '1px 4px',
             }}
-            title="选择 Git 仓库"
+            title={repos.find((repo) => repo.path === gitRoot)?.name ?? '选择 Git 仓库'}
           >
             {repos.map((repo) => (
               <option key={repo.path} value={repo.path}>{repo.name}（{repo.branch}）</option>
             ))}
           </select>
         )}
-        <span style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+        <span style={{ marginLeft: 'auto', flexShrink: 0, display: 'flex', gap: 6 }}>
           <button type="button" onClick={loadLog} style={buttonStyle(busy)}>{showLog ? '状态' : '历史'}</button>
           <button type="button" onClick={() => refresh()} style={buttonStyle(busy)} disabled={busy}>⟳</button>
         </span>
