@@ -209,7 +209,7 @@ export function GitPanel({ root }: GitPanelProps): JSX.Element {
             value={gitRoot}
             onChange={(event) => { activeRepoRef.current = event.target.value; setActiveRepo(event.target.value) }}
             style={{
-              fontSize: 11, maxWidth: 160, minWidth: 0, flexShrink: 1,
+              fontSize: 11, flex: '0 0 auto', maxWidth: 280,
               background: 'var(--dsw-alias-bg-base,#ffffff)',
               color: 'inherit', border: '1px solid var(--ide-border,#e5e6eb)', borderRadius: 3, padding: '1px 4px',
             }}
