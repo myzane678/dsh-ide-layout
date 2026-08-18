@@ -28,6 +28,8 @@ import { php } from '@codemirror/lang-php'
 import { vue } from '@codemirror/lang-vue'
 import { sass } from '@codemirror/lang-sass'
 import { less } from '@codemirror/lang-less'
+import { StreamLanguage } from '@codemirror/language'
+import { toml } from '@codemirror/legacy-modes/mode/toml'
 import { apiRead, apiRun, apiWrite } from '../api.ts'
 import type { RunResult } from '../api.ts'
 import type { EditorTab } from '../store.ts'
@@ -79,6 +81,7 @@ function languageFor(path: string): Extension {
     case 'vue': return vue()
     case 'scss': return sass()
     case 'less': return less()
+    case 'toml': return StreamLanguage.define(toml)
     default: return []
   }
 }
