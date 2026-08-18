@@ -2,17 +2,19 @@
  *  unstage / discard per file, inline diff, commit box, and recent history.
  *  Everything talks to the host git service (/dsh-ide/git/*, no shell). */
 
-import { useCallback, useEffect, useState, type JSX } from 'react'
+import { useCallback, useEffect, useRef, useState, type JSX } from 'react'
 import {
   apiGitCommit,
   apiGitCommitDiff,
   apiGitDiff,
   apiGitDiscard,
   apiGitLog,
+  apiGitRepos,
   apiGitStage,
   apiGitStatus,
   apiGitUnstage,
   type GitLogEntry,
+  type GitRepoInfo,
   type GitStatusEntry,
   type GitStatusResult,
 } from '../api.ts'
@@ -76,6 +78,22 @@ export function GitPanel({ root }: GitPanelProps): JSX.Element {
   const [showLog, setShowLog] = useState(false)
   const [commitDiff, setCommitDiff] = useState<{ hash: string; text: string } | null>(null)
   const [notice, setNotice] = useState('')
+  /** Nested repos under the workspace root; empty when root itself is a repo. */
+  const [repos, setRepos] = useState<GitRepoInfo[]>([])
+  /** Currently targeted repo root ('' = workspace root). */
+  const [activeRepo, setActiveRepo] = useState('')
+
+  // The repo path every git call runs against: the selected nested repo, or
+  // the workspace root when none was picked.
+  const gitRoot = activeRepo !== '' ? activeRepo : root
+
+  // Keep the freshest target in a ref so refresh() can switch repos without
+  // recreating the callback (avoids a render loop via the root effect below).
+  const activeRepoRef = useRef('')
+  const pickRepo = (path: string): void => {
+    activeRepoRef.current = path
+    setActiveRepo(path)
+  }
 
   const flash = (text: string): void => {
     setNotice(text)
@@ -83,11 +101,24 @@ export function GitPanel({ root }: GitPanelProps): JSX.Element {
   }
 
   const refresh = useCallback((): void => {
-    if (root === '') return
-    void apiGitStatus(root).then((result) => {
+    const target = activeRepoRef.current !== '' ? activeRepoRef.current : root
+    if (target === '') return
+    void apiGitStatus(target).then((result) => {
       if (result.ok) {
         setStatus(result.value)
         setError(null)
+        // Workspace root is not a repo: discover nested repos once and auto-pick
+        // the first one so the panel still shows git state for sub-projects.
+        if (!result.value.isRepo && activeRepoRef.current === '') {
+          void apiGitRepos(root).then((reposResult) => {
+            if (reposResult.ok && reposResult.value.length > 0) {
+              setRepos(reposResult.value)
+              pickRepo(reposResult.value[0]!.path)
+            } else {
+              setRepos([])
+            }
+          })
+        }
       } else {
         setError(result.error.message)
       }
@@ -100,8 +131,16 @@ export function GitPanel({ root }: GitPanelProps): JSX.Element {
     setLog(null)
     setShowLog(false)
     setCommitDiff(null)
+    setRepos([])
+    activeRepoRef.current = ''
+    setActiveRepo('')
     refresh()
   }, [root, refresh])
+
+  // When the target repo changes (auto-pick or manual selection), reload status.
+  useEffect(() => {
+    if (activeRepo !== '' && activeRepo !== root) refresh()
+  }, [activeRepo, root, refresh])
 
   /** 跑一个 git 操作，完成后刷新状态。 */
   const run = async (label: string, fn: () => Promise<boolean>): Promise<void> => {
@@ -123,7 +162,7 @@ export function GitPanel({ root }: GitPanelProps): JSX.Element {
   }
 
   const viewDiff = (path: string, staged: boolean): void => {
-    void apiGitDiff(root, path, staged).then((result) => {
+    void apiGitDiff(gitRoot, path, staged).then((result) => {
       if (result.ok) setDiff({ path, staged, text: result.value })
       else setError(result.error.message)
     })
@@ -133,14 +172,14 @@ export function GitPanel({ root }: GitPanelProps): JSX.Element {
     const text = message.trim()
     if (text === '') return
     setMessage('')
-    void run('已提交', () => apiGitCommit(root, text).then((r) => r.ok))
+    void run('已提交', () => apiGitCommit(gitRoot, text).then((r) => r.ok))
   }
 
   const loadLog = (): void => {
     const next = !showLog
     setShowLog(next)
     if (next && log === null) {
-      void apiGitLog(root, 20).then((result) => {
+      void apiGitLog(gitRoot, 20).then((result) => {
         if (result.ok) setLog(result.value)
         else setError(result.error.message)
       })
@@ -154,7 +193,7 @@ export function GitPanel({ root }: GitPanelProps): JSX.Element {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
-      {/* 标题行：分支 + 操作 */}
+      {/* 标题行：分支 + 仓库选择 + 操作 */}
       <div style={{
         display: 'flex', alignItems: 'center', gap: 6, padding: '6px 10px',
         borderBottom: '1px solid var(--ide-border,#e5e6eb)', flexShrink: 0,
@@ -162,6 +201,21 @@ export function GitPanel({ root }: GitPanelProps): JSX.Element {
         <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--ide-muted,#6b7280)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
           {status === null ? 'Git' : status.isRepo ? `分支 ${status.branch ?? 'HEAD'}` : '非 Git 仓库'}
         </span>
+        {repos.length > 0 && (
+          <select
+            value={gitRoot}
+            onChange={(event) => { activeRepoRef.current = event.target.value; setActiveRepo(event.target.value) }}
+            style={{
+              fontSize: 11, maxWidth: 150, background: 'var(--dsw-alias-bg-base,#ffffff)',
+              color: 'inherit', border: '1px solid var(--ide-border,#e5e6eb)', borderRadius: 3, padding: '1px 4px',
+            }}
+            title="选择 Git 仓库"
+          >
+            {repos.map((repo) => (
+              <option key={repo.path} value={repo.path}>{repo.name}（{repo.branch}）</option>
+            ))}
+          </select>
+        )}
         <span style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
           <button type="button" onClick={loadLog} style={buttonStyle(busy)}>{showLog ? '状态' : '历史'}</button>
           <button type="button" onClick={() => refresh()} style={buttonStyle(busy)} disabled={busy}>⟳</button>
@@ -193,7 +247,7 @@ export function GitPanel({ root }: GitPanelProps): JSX.Element {
                         return
                       }
                       setCommitDiff({ hash: entry.hash, text: '加载中…' })
-                      void apiGitCommitDiff(root, entry.hash).then((result) => {
+                      void apiGitCommitDiff(gitRoot, entry.hash).then((result) => {
                         setCommitDiff(result.ok
                           ? { hash: entry.hash, text: result.value }
                           : { hash: entry.hash, text: `加载失败: ${result.error.message}` })
@@ -244,10 +298,10 @@ export function GitPanel({ root }: GitPanelProps): JSX.Element {
                     <span style={{ color, fontSize: 11, flexShrink: 0 }}>{label}</span>
                     <span style={{ display: 'flex', gap: 4, flexShrink: 0 }} onClick={(event) => event.stopPropagation()}>
                       {isStaged
-                        ? <button type="button" disabled={busy} style={buttonStyle(busy)} onClick={() => void run('已取消暂存', () => apiGitUnstage(root, entry.path).then((r) => r.ok))}>取消暂存</button>
-                        : <button type="button" disabled={busy} style={buttonStyle(busy)} onClick={() => void run('已暂存', () => apiGitStage(root, entry.path).then((r) => r.ok))}>{entry.xy === '??' ? '添加' : '暂存'}</button>}
+                        ? <button type="button" disabled={busy} style={buttonStyle(busy)} onClick={() => void run('已取消暂存', () => apiGitUnstage(gitRoot, entry.path).then((r) => r.ok))}>取消暂存</button>
+                        : <button type="button" disabled={busy} style={buttonStyle(busy)} onClick={() => void run('已暂存', () => apiGitStage(gitRoot, entry.path).then((r) => r.ok))}>{entry.xy === '??' ? '添加' : '暂存'}</button>}
                       {!isStaged && entry.xy !== '??' && (
-                        <button type="button" disabled={busy} style={buttonStyle(busy)} onClick={() => { if (window.confirm(`放弃对 ${entry.path} 的修改？`)) void run('已放弃修改', () => apiGitDiscard(root, entry.path).then((r) => r.ok)) }}>放弃</button>
+                        <button type="button" disabled={busy} style={buttonStyle(busy)} onClick={() => { if (window.confirm(`放弃对 ${entry.path} 的修改？`)) void run('已放弃修改', () => apiGitDiscard(gitRoot, entry.path).then((r) => r.ok)) }}>放弃</button>
                       )}
                     </span>
                   </div>

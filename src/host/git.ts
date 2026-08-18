@@ -10,6 +10,8 @@
  * user.name/user.email).
  */
 import { spawn } from 'node:child_process'
+import { readdir, stat } from 'node:fs/promises'
+import { join } from 'node:path'
 
 /** A parsed `git status --porcelain=v1 -z` entry. */
 export interface GitStatusEntry {
@@ -129,6 +131,44 @@ export async function isGitRepo(cwd: string): Promise<boolean> {
   } catch {
     return false
   }
+}
+
+/**
+ * Discover git repositories below `root` (the workspace root itself included).
+ * Walk the directory tree, skipping node_modules / hidden dirs / .git internals,
+ * and collect every directory that contains a `.git` entry (dir or worktree
+ * file). Used by the git panel to offer nested repos when the workspace root
+ * itself is not a repo. Depth is bounded so huge trees stay cheap.
+ */
+export async function findRepos(root: string, maxDepth = 5): Promise<string[]> {
+  const found: string[] = []
+  const seen = new Set<string>()
+  const walk = async (dir: string, depth: number): Promise<void> => {
+    if (depth > maxDepth || seen.has(dir)) return
+    seen.add(dir)
+    try {
+      await stat(join(dir, '.git'))
+      found.push(dir)
+      // A repo boundary: don't descend into its submodules/worktrees.
+      return
+    } catch {
+      // not a repo, keep walking
+    }
+    let entries
+    try {
+      entries = await readdir(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue
+      const name = entry.name
+      if (name === 'node_modules' || name.startsWith('.')) continue
+      await walk(join(dir, name), depth + 1)
+    }
+  }
+  await walk(root, 1)
+  return found
 }
 
 /** The repository top level containing `cwd` (`git rev-parse --show-toplevel`). */

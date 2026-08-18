@@ -330,6 +330,20 @@ export function registerPanelRoutes(ctx: Context, fs: FsService): () => void {
         json(res, result.ok ? OK(result.value) : FAIL(result.error))
         return
       }
+      case '/dsh-ide/git/repos': {
+        // Discover git repos below the gated root (root itself included) so the
+        // panel can offer nested repos when the workspace root is not one.
+        const result = await withGitRoot(fs, root, async (cwd) => {
+          const repos = await git.findRepos(cwd)
+          return Promise.all(repos.map(async (repo) => ({
+            path: repo,
+            name: repo === cwd ? repo : repo.slice(cwd.length + 1).replaceAll('\\', '/'),
+            branch: await git.currentBranch(repo).catch(() => 'HEAD'),
+          })))
+        })
+        json(res, result.ok ? OK(result.value) : FAIL(result.error))
+        return
+      }
       case '/dsh-ide/git/diff': {
         const staged = strField(payload, 'staged') === 'true'
         const result = await gitWithOptionalPath(fs, root, payload, (cwd, path) => git.diff(cwd, path, staged))

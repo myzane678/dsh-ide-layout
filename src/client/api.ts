@@ -91,8 +91,21 @@ export interface GitLogEntry {
   refs: string
 }
 
+/** One discovered git repo below a workspace root. */
+export interface GitRepoInfo {
+  /** Absolute path of the repo root (also the git-API root). */
+  path: string
+  /** Display name: relative to the workspace root (basename when it is the root). */
+  name: string
+  branch: string
+}
+
 export function apiGitStatus(root: string): Promise<Envelope<GitStatusResult>> {
   return post<GitStatusResult>('/dsh-ide/git/status', { root })
+}
+
+export function apiGitRepos(root: string): Promise<Envelope<GitRepoInfo[]>> {
+  return post<GitRepoInfo[]>('/dsh-ide/git/repos', { root })
 }
 
 export function apiGitDiff(root: string, path: string | undefined, staged: boolean): Promise<Envelope<string>> {
