@@ -1034,8 +1034,22 @@ export function EditorPane({
             </span>
           </div>
         ))}
-        {/* 右侧按钮组：终端 | 运行 | 关闭编辑区 */}
+        {/* 右侧按钮组：保存 | 终端 | 运行 | 关闭编辑区 */}
         <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8, paddingRight: 8, flexShrink: 0 }}>
+          <button
+            onClick={() => { if (activeTab !== null) requestSave(activeTab) }}
+            disabled={activeTab === null || !activeTab.dirty}
+            title={activeTab === null ? '先打开一个文件' : activeTab.dirty ? `保存 ${activeTab.path}（Ctrl+S）` : '没有未保存的更改'}
+            style={{
+              padding: '4px 10px', fontSize: 12,
+              cursor: activeTab !== null && activeTab.dirty ? 'pointer' : 'default',
+              color: activeTab !== null && activeTab.dirty ? '#16a34a' : '#9ca3af',
+              background: 'transparent', border: '1px solid var(--ide-border,#e5e6eb)',
+              borderRadius: 4, whiteSpace: 'nowrap',
+            }}
+          >
+            💾 保存
+          </button>
           <button
             onClick={() => setTermVisible((visible) => !visible)}
             title="终端（显示/隐藏底部终端面板）"
