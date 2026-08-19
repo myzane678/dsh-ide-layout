@@ -17,12 +17,13 @@ import { WebSocket } from 'ws'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { FsService } from './fs-service.ts'
 import type { PtyService } from './pty-service.ts'
+import { closeWs } from './ws-safe.ts'
 
 /** Grace after the last connection drops before the shell is killed. */
 const RECONNECT_GRACE_MS = 30_000
 
 /** Parse a raw frame: a recognized JSON control or raw terminal input. */
-function parseFrame(text: string): { type: 'resize' | 'close'; cols?: number; rows?: number } | null {
+function parseFrame(text: string): { type: 'resize' | 'close' | 'restart'; cols?: number; rows?: number } | null {
   let parsed: unknown = null
   try {
     parsed = JSON.parse(text)
@@ -32,6 +33,7 @@ function parseFrame(text: string): { type: 'resize' | 'close'; cols?: number; ro
   if (parsed === null || typeof parsed !== 'object') return null
   const record = parsed as Record<string, unknown>
   if (record.type === 'close') return { type: 'close' }
+  if (record.type === 'restart') return { type: 'restart' }
   if (
     record.type === 'resize'
     && typeof record.cols === 'number' && typeof record.rows === 'number'
@@ -59,7 +61,7 @@ export function attachTerminalSocket(
       }
       const gated = await fs.verify(root)
       if (!gated.ok || gated.canonical === undefined) {
-        ws.close(1011, gated.error?.message ?? 'root not gated')
+        closeWs(ws, 1011, gated.error?.message ?? 'root not gated')
         return
       }
       const canonicalRoot = gated.canonical
@@ -81,6 +83,12 @@ export function attachTerminalSocket(
           pty.release(canonicalRoot, 0)
           return
         }
+        if (frame !== null && frame.type === 'restart') {
+          // 主动重启：立即杀 shell（不走 release 宽限——否则会被 ws.on('close')
+          // 的 30s 宽限覆盖），客户端随后断开重连，open 会重新 spawn 全新 shell。
+          pty.close(canonicalRoot)
+          return
+        }
         if (handle.exited) return
         if (frame !== null && frame.type === 'resize') {
           handle.pty.resize(Math.max(2, Math.floor(frame.cols as number)), Math.max(2, Math.floor(frame.rows as number)))
@@ -94,7 +102,7 @@ export function attachTerminalSocket(
         pty.release(canonicalRoot, RECONNECT_GRACE_MS)
       })
     } catch (error) {
-      ws.close(1011, error instanceof Error ? error.message : String(error))
+      closeWs(ws, 1011, error instanceof Error ? error.message : String(error))
     }
   })()
 }

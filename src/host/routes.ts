@@ -7,7 +7,7 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { spawn } from 'node:child_process'
-import { dirname } from 'node:path'
+import { dirname, relative } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { PanelError } from '../core/types.ts'
@@ -402,6 +402,45 @@ export function registerPanelRoutes(ctx: Context, fs: FsService): () => void {
         }
         const result = await withGitRoot(fs, root, (cwd) => git.commitDiff(cwd, hash))
         json(res, result.ok ? OK(result.value) : FAIL(result.error))
+        return
+      }
+      case '/dsh-ide/git/blame': {
+        const path = strField(payload, 'path')
+        if (path === null || !isSafeGitPath(path)) {
+          json(res, FAIL(BAD_REQUEST))
+          return
+        }
+        const gated = await fs.verify(root)
+        if (!gated.ok || gated.canonical === undefined) {
+          json(res, FAIL(gated.error ?? { code: 'forbidden', message: 'root not gated' }))
+          return
+        }
+        // 先解析文件绝对路径：blame 是编辑器功能（无仓库选择器），当工作区
+        // root 只是父目录、文件属于嵌套子仓库时（如多插件工作区 E:\dsh-plugins
+        // 下的各插件），git -C <root> 找不到仓库——自动从文件向上找最近仓库根。
+        const resolved = await fs.resolve(root, path)
+        if (!('abs' in resolved)) {
+          json(res, FAIL(resolved))
+          return
+        }
+        let cwd = gated.canonical
+        let relPath = path
+        if (!(await git.isGitRepo(cwd))) {
+          const repo = await git.findRepoRootForFile(resolved.abs)
+          if (repo === null) {
+            // 不在任何仓库内（未跟踪新文件 / 非仓库目录）：无 blame，不算错误。
+            json(res, OK({ path, lines: [] }))
+            return
+          }
+          cwd = repo
+          relPath = relative(cwd, resolved.abs).replaceAll('\\', '/')
+        }
+        try {
+          const lines = await git.blame(cwd, relPath)
+          json(res, OK({ path, lines }))
+        } catch (error) {
+          json(res, FAIL({ code: 'git-error', message: error instanceof Error ? error.message : String(error) }))
+        }
         return
       }
       default:

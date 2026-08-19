@@ -5,8 +5,8 @@
 import { useEffect, useRef, useState, type JSX } from 'react'
 import { createPortal } from 'react-dom'
 import { basicSetup } from 'codemirror'
-import { EditorView, hoverTooltip, keymap, type Tooltip } from '@codemirror/view'
-import { Prec, EditorState, type Extension, type Text } from '@codemirror/state'
+import { EditorView, GutterMarker, gutter, hoverTooltip, keymap, type Tooltip } from '@codemirror/view'
+import { Compartment, Prec, EditorState, type Extension, type Text } from '@codemirror/state'
 import { HighlightStyle, syntaxHighlighting } from '@codemirror/language'
 import { tags as t } from '@lezer/highlight'
 import { autocompletion, acceptCompletion, type CompletionContext, type CompletionResult } from '@codemirror/autocomplete'
@@ -33,8 +33,8 @@ import { toml } from '@codemirror/legacy-modes/mode/toml'
 import { powerShell } from '@codemirror/legacy-modes/mode/powershell'
 import { shell } from '@codemirror/legacy-modes/mode/shell'
 import { batchLanguage } from '../batch-mode.ts'
-import { apiRead, apiRun, apiWrite } from '../api.ts'
-import type { RunResult } from '../api.ts'
+import { apiGitBlame, apiRead, apiRun, apiWrite } from '../api.ts'
+import type { BlameLine, RunResult } from '../api.ts'
 import type { EditorTab } from '../store.ts'
 import { languageIdForPath } from '../../core/types.ts'
 import {
@@ -92,20 +92,25 @@ function languageFor(path: string): Extension {
   }
 }
 
-/** 高对比高亮：经典 IDE 配色（关键字深蓝加粗 / 注释绿斜体 / 字符串深红 / 数字深绿），
- *  让各语法元素一眼可分。颜色用 CSS 变量承载：默认亮色系（浅背景），
+/** 高对比高亮：经典 IDE 配色（关键字深蓝加粗 / 注释绿斜体 / 字符串暖棕 / 数字深绿）。
+ *  配色刻意避开红色系：红色只留给 LSP 诊断的「红色下波浪线」（错误语义唯一来源），
+ *  避免普通高亮被误认成报错。颜色用 CSS 变量承载：默认亮色系（浅背景），
  *  皮肤（如 maid-atelier）可在自己的 CSS 里按亮/暗主题覆盖变量适配深背景。 */
 const ideHighlight = HighlightStyle.define([
   { tag: [t.keyword, t.controlKeyword, t.moduleKeyword, t.operatorKeyword, t.definitionKeyword], color: 'var(--ide-hl-keyword, #0000FF)', fontWeight: '600' },
   { tag: [t.comment, t.lineComment, t.blockComment, t.docComment], color: 'var(--ide-hl-comment, #008000)', fontStyle: 'italic' },
-  { tag: [t.string, t.special(t.string), t.character], color: 'var(--ide-hl-string, #A31515)' },
+  // 字符串用暖棕（避开 #A31515 深红，防止与错误提示混淆）。
+  { tag: [t.string, t.special(t.string), t.character], color: 'var(--ide-hl-string, #B45309)' },
   { tag: [t.number, t.integer, t.float], color: 'var(--ide-hl-number, #098658)' },
   { tag: [t.bool, t.null, t.atom], color: 'var(--ide-hl-bool, #0000FF)' },
   { tag: [t.function(t.variableName), t.definition(t.function(t.variableName))], color: 'var(--ide-hl-function, #795E26)' },
   { tag: [t.className, t.typeName, t.definition(t.className)], color: 'var(--ide-hl-class, #267F99)' },
   { tag: [t.propertyName], color: 'var(--ide-hl-property, #0070C1)' },
   { tag: [t.definition(t.variableName)], color: 'var(--ide-hl-variable, #001080)' },
-  { tag: t.invalid, color: 'var(--ide-hl-invalid, #FF0000)' },
+  // invalid 高亮改中性灰：真正的语法错误由 LSP 红色波浪线表达（红线只此一处语义）。
+  { tag: t.invalid, color: 'var(--ide-hl-invalid, #6B7280)' },
+  // 兜底：未显式覆盖的符号类 tag 统一用主文字色（防语言包/默认 style 带红色系）。
+  { tag: [t.operator, t.punctuation, t.bracket, t.separator, t.attributeName, t.meta, t.processingInstruction], color: 'var(--ide-hl-base, #24292F)' },
   // Markdown：标题加粗深蓝 / 强调斜体 / 链接下划线蓝 / 引用与行内代码 / 删除线灰。
   { tag: [t.heading, t.heading1, t.heading2, t.heading3, t.heading4, t.heading5, t.heading6], color: 'var(--ide-hl-heading, #0000FF)', fontWeight: '600' },
   { tag: [t.emphasis, t.strong], color: 'var(--ide-hl-emphasis, #795E26)', fontStyle: 'italic' },
@@ -113,6 +118,94 @@ const ideHighlight = HighlightStyle.define([
   { tag: [t.quote, t.monospace], color: 'var(--ide-hl-quote, #008000)' },
   { tag: t.strikethrough, color: 'var(--ide-hl-strikethrough, #9ca3af)' },
 ])
+
+/** GitLens 式行内 blame：超过该行数的文件不自动标注（输出量与行数线性相关）。 */
+const BLAME_MAX_LINES = 2000
+
+/** 相对时间（GitLens 风格）：刚刚 / N 分钟前 / N 小时前 / N 天前 / 日期。 */
+function relativeTime(unix: number): string {
+  if (unix <= 0) return ''
+  const diff = Date.now() / 1000 - unix
+  if (diff < 60) return '刚刚'
+  if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`
+  if (diff < 86_400) return `${Math.floor(diff / 3600)} 小时前`
+  if (diff < 86_400 * 30) return `${Math.floor(diff / 86_400)} 天前`
+  const date = new Date(unix * 1000)
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+}
+
+/** 是否未提交行（空或全 0 hash）。 */
+function isUncommitted(hash: string): boolean {
+  return hash === '' || /^0+$/.test(hash)
+}
+
+/** 短 hash（7 位）；未提交行返回 null。 */
+function shortHash(hash: string): string | null {
+  if (isUncommitted(hash)) return null
+  return hash.slice(0, 7)
+}
+
+/** blame 悬停详情浮层 DOM（作者/日期/提交信息/hash，复用浮层样式变量）。 */
+function blameTooltipDom(info: BlameLine): HTMLElement {
+  const container = document.createElement('div')
+  container.style.cssText = [
+    'max-width: 460px', 'font-size: 12px', 'line-height: 1.6',
+    'padding: 8px 10px', 'border-radius: 6px',
+    'background: var(--dsw-alias-bg-overlay, rgba(248,250,255,0.98))',
+    'color: var(--dsw-alias-label-primary, #1a1a1a)',
+    'border: 1px solid var(--ide-border, #e5e6eb)',
+    'box-shadow: 0 8px 24px rgba(0,0,0,0.28)',
+  ].join('; ')
+  const rows: Array<[string, string]> = []
+  if (isUncommitted(info.hash)) {
+    rows.push(['状态', '未提交（工作区改动）'])
+  } else {
+    rows.push(['提交', info.hash])
+    rows.push(['作者', info.mail !== '' ? `${info.author} <${info.mail}>` : info.author])
+    const rel = relativeTime(info.time)
+    rows.push(['日期', rel !== '' ? `${rel}（${new Date(info.time * 1000).toLocaleString()}）` : ''])
+  }
+  rows.push(['说明', info.summary])
+  for (const [label, value] of rows) {
+    if (value === '') continue
+    const row = document.createElement('div')
+    row.style.cssText = 'display: flex; gap: 8px;'
+    const labelEl = document.createElement('span')
+    labelEl.style.cssText = 'flex: 0 0 44px; color: #9ca3af; white-space: nowrap;'
+    labelEl.textContent = label
+    const valueEl = document.createElement('span')
+    valueEl.style.cssText = 'flex: 1; word-break: break-all;'
+    valueEl.textContent = value
+    row.appendChild(labelEl)
+    row.appendChild(valueEl)
+    container.appendChild(row)
+  }
+  return container
+}
+
+/** blame 悬停浮层单例（marker 重建/移出视口时不会触发 mouseleave，靠单例清理）。 */
+let blameTooltipEl: HTMLElement | null = null
+function showBlameTooltip(anchor: HTMLElement, info: BlameLine): void {
+  hideBlameTooltip()
+  const el = blameTooltipDom(info)
+  el.style.position = 'fixed'
+  el.style.zIndex = '2000'
+  document.body.appendChild(el)
+  blameTooltipEl = el
+  const rect = anchor.getBoundingClientRect()
+  const width = Math.min(460, window.innerWidth - 16)
+  let left = rect.left
+  if (left + width > window.innerWidth - 8) left = Math.max(8, window.innerWidth - width - 8)
+  el.style.width = `${width}px`
+  el.style.left = `${left}px`
+  el.style.top = `${Math.max(4, rect.top - el.offsetHeight - 6)}px`
+}
+function hideBlameTooltip(): void {
+  if (blameTooltipEl !== null) {
+    blameTooltipEl.remove()
+    blameTooltipEl = null
+  }
+}
 
 interface CodeMirrorPaneProps {
   tab: EditorTab
@@ -138,6 +231,10 @@ interface CodeMirrorPaneProps {
   fontSize: number
   /** 字号变化回调（Ctrl/Cmd+滚轮），父层持久化并显示。 */
   onFontSizeChange: (size: number) => void
+  /** 本文件的 git blame（1-based 行号→提交信息，升序）；null = 无 blame。 */
+  blame: BlameLine[] | null
+  /** 整文件 blame gutter 是否启用（关闭时整个 gutter 列不渲染，不占空间）。 */
+  blameEnabled: boolean
 }
 
 /** LSP 0-based {line, character} → CodeMirror 文档 offset。 */
@@ -293,6 +390,23 @@ function menuItemStyle(): React.CSSProperties {
   }
 }
 
+/** 菜单项按钮：hover 时背景加深（内联样式表达不了 :hover，用 hover 状态切换）。
+ *  半透明灰在亮/暗浮层上都可见，与皮肤 overlay 变量兼容。 */
+function MenuItemButton({ onClick, children }: { onClick: () => void; children: React.ReactNode }): JSX.Element {
+  const [hover, setHover] = useState(false)
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{ ...menuItemStyle(), background: hover ? 'rgba(127,127,127,0.12)' : 'transparent' }}
+    >
+      {children}
+    </button>
+  )
+}
+
 /** 取光标所在处的标识符单词（向前向后扩展 [\w$]）。 */
 function wordAt(view: EditorView, pos: number): string | null {
   const doc = view.state.doc
@@ -424,7 +538,7 @@ async function codeActionsFor(
 /** One CodeMirror instance per tab. The parent remounts this component via
  * `key={tab.id}` on tab switch; the view is created once on mount and
  * destroyed on unmount (non-controlled: doc flows out via updateListener). */
-function CodeMirrorPane({ tab, onContentChange, onSave, onContextAction, lsp, diagnostics, onOpenLocation, revealLine, onRevealDone, root, onCursor, fontSize, onFontSizeChange }: CodeMirrorPaneProps): JSX.Element {
+function CodeMirrorPane({ tab, onContentChange, onSave, onContextAction, lsp, diagnostics, onOpenLocation, revealLine, onRevealDone, root, onCursor, fontSize, onFontSizeChange, blame, blameEnabled }: CodeMirrorPaneProps): JSX.Element {
   const hostRef = useRef<HTMLDivElement | null>(null)
   const viewRef = useRef<EditorView | null>(null)
   // 右键菜单：无选中时也弹出（重命名/格式化/快速修复）；text 为空表示无选中。
@@ -434,8 +548,55 @@ function CodeMirrorPane({ tab, onContentChange, onSave, onContextAction, lsp, di
   // 重命名输入框
   const [renameBox, setRenameBox] = useState<{ x: number; y: number; initial: string } | null>(null)
   // Latest props for the mount-time closures (keymap / updateListener / LSP).
-  const propsRef = useRef({ tab, onContentChange, onSave, lsp, diagnostics, onOpenLocation, revealLine, onRevealDone, root, onCursor, fontSize, onFontSizeChange })
-  propsRef.current = { tab, onContentChange, onSave, lsp, diagnostics, onOpenLocation, revealLine, onRevealDone, root, onCursor, fontSize, onFontSizeChange }
+  const propsRef = useRef({ tab, onContentChange, onSave, lsp, diagnostics, onOpenLocation, revealLine, onRevealDone, root, onCursor, fontSize, onFontSizeChange, blame, blameEnabled })
+  propsRef.current = { tab, onContentChange, onSave, lsp, diagnostics, onOpenLocation, revealLine, onRevealDone, root, onCursor, fontSize, onFontSizeChange, blame, blameEnabled }
+  // Blame gutter 的 Compartment：数据异步到达/保存后刷新时 reconfigure 触发
+  // gutter 重建（lineMarker 每次重建读 propsRef 的最新 blame）。实例必须稳定
+  // （每个 tab 一个），用 ref 保证跨渲染一致。
+  const blameCompartmentRef = useRef<Compartment | null>(null)
+  if (blameCompartmentRef.current === null) blameCompartmentRef.current = new Compartment()
+  // Blame gutter：marker 内容 = 短 hash + 作者（未提交行显示「未提交」）。
+  // 悬停显示完整提交详情浮层（单例，mouseleave / 编辑器 mouseleave 时清理）。
+  const blameGutter = gutter({
+    class: 'cm-blame-gutter',
+    lineMarker: (view, line) => {
+      const list = propsRef.current.blame
+      if (list === null || list.length === 0) return null
+      const lineNumber = view.state.doc.lineAt(line.from).number
+      let low = 0
+      let high = list.length - 1
+      let info: BlameLine | null = null
+      while (low <= high) {
+        const mid = (low + high) >> 1
+        const item = list[mid]!
+        if (item.line === lineNumber) { info = item; break }
+        if (item.line < lineNumber) low = mid + 1
+        else high = mid - 1
+      }
+      if (info === null) return null
+      const short = shortHash(info.hash)
+      const text = short !== null ? `${short} ${info.author}` : '未提交'
+      return new class extends GutterMarker {
+        toDOM(): HTMLElement {
+          const marker = document.createElement('span')
+          marker.textContent = text
+          marker.style.cssText = 'white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: default;'
+          marker.addEventListener('mouseenter', () => {
+            marker.style.color = 'var(--ide-hl-keyword, #0000FF)'
+            showBlameTooltip(marker, info)
+          })
+          marker.addEventListener('mouseleave', () => {
+            marker.style.color = ''
+            hideBlameTooltip()
+          })
+          return marker
+        }
+        eq(other: GutterMarker): boolean {
+          return other === this
+        }
+      }()
+    },
+  })
 
   // Ctrl/Cmd + 滚轮调整编辑器字号（VS Code 习惯）。
   useEffect(() => {
@@ -465,6 +626,10 @@ function CodeMirrorPane({ tab, onContentChange, onSave, onContextAction, lsp, di
         // 自定义配色完全失效；不带 fallback 时本高亮器与语言高亮并列，注册靠后 CSS 优先
         syntaxHighlighting(ideHighlight),
         EditorView.lineWrapping,
+        // GitLens 式行内 blame gutter：初始空占位，由 useEffect 按
+        // (blameEnabled, blame) 动态 reconfigure —— 未启用时整个 gutter 列
+        // 不渲染（不占空间），启用且有数据时才挂载。
+        blameCompartmentRef.current!.of([]),
         EditorView.theme({
           '&': {
             height: '100%', fontSize: 'var(--ide-editor-font-size, 13px)',
@@ -476,6 +641,12 @@ function CodeMirrorPane({ tab, onContentChange, onSave, onContextAction, lsp, di
             backgroundColor: 'var(--dsw-alias-bg-base, #ffffff)',
             borderRight: '1px solid rgba(127,127,127,0.2)',
             color: '#9ca3af',
+          },
+          // GitLens 式 blame gutter：固定宽度 + 超长省略（完整信息走悬停浮层）。
+          '.cm-blame-gutter': { flex: '0 0 118px', borderRight: '1px solid rgba(127,127,127,0.12)' },
+          '.cm-blame-gutter .cm-gutterElement': {
+            width: '118px', boxSizing: 'border-box', padding: '0 6px 0 4px',
+            fontSize: 11, color: '#9ca3af', overflow: 'hidden',
           },
           '.cm-activeLine': { backgroundColor: 'rgba(127,127,127,0.08)' },
           '.cm-activeLineGutter': { backgroundColor: 'rgba(127,127,127,0.08)' },
@@ -589,8 +760,14 @@ function CodeMirrorPane({ tab, onContentChange, onSave, onContextAction, lsp, di
     // 文档生命周期：didOpen（挂载时）+ didClose（卸载时）。切 tab 时组件以
     // key=tab.id 重建，旧实例卸载 → didClose，新实例挂载 → didOpen。
     propsRef.current.lsp?.openDocument(propsRef.current.tab.path, propsRef.current.tab.content)
+    // 鼠标离开编辑器（含 gutter）时清理 blame 悬停浮层（marker 移出视口
+    // 不触发 mouseleave，用编辑器 DOM 的 mouseleave 兜底）。
+    const onDomMouseLeave = (): void => hideBlameTooltip()
+    view.dom.addEventListener('mouseleave', onDomMouseLeave)
     return () => {
       viewRef.current = null
+      view.dom.removeEventListener('mouseleave', onDomMouseLeave)
+      hideBlameTooltip()
       propsRef.current.lsp?.closeDocument(propsRef.current.tab.path)
       view.destroy()
     }
@@ -611,6 +788,18 @@ function CodeMirrorPane({ tab, onContentChange, onSave, onContextAction, lsp, di
     const view = viewRef.current
     if (view !== null && lsp !== null) forceLinting(view)
   }, [diagnostics, lsp])
+
+  // blame 数据 / 开关变化 → reconfigure gutter：仅当「开关打开 且 数据非空」
+  // 才挂载 gutter 列（否则挂空，整列不渲染不占空间）；Compartment 只重算该
+  // gutter 扩展（不动其他配置），lineMarker 每次重建读 propsRef 的最新 blame。
+  useEffect(() => {
+    const view = viewRef.current
+    const compartment = blameCompartmentRef.current
+    if (view === null || compartment === null) return
+    const list = propsRef.current.blame
+    const show = propsRef.current.blameEnabled && list !== null && list.length > 0
+    view.dispatch({ effects: compartment.reconfigure(show ? blameGutter : []) })
+  }, [blame, blameEnabled])
 
   // 跳转定义后定位：本文件已打开时，revealLine 变化 → 光标跳到目标行并滚动到视口。
   useEffect(() => {
@@ -689,8 +878,7 @@ function CodeMirrorPane({ tab, onContentChange, onSave, onContextAction, lsp, di
           }}
           onContextMenu={(event) => event.preventDefault()}
         >
-          <button
-            type="button"
+          <MenuItemButton
             onClick={() => {
               const view = viewRef.current
               const m = menu
@@ -701,12 +889,10 @@ function CodeMirrorPane({ tab, onContentChange, onSave, onContextAction, lsp, di
                 if (items.length > 0) setActions({ items, x: m.x, y: m.y })
               })
             }}
-            style={menuItemStyle()}
           >
             💡 快速修复
-          </button>
-          <button
-            type="button"
+          </MenuItemButton>
+          <MenuItemButton
             onClick={() => {
               const view = viewRef.current
               const m = menu
@@ -716,40 +902,33 @@ function CodeMirrorPane({ tab, onContentChange, onSave, onContextAction, lsp, di
               const word = wordAt(view, cursor)
               setRenameBox({ x: m.x, y: m.y, initial: word ?? '' })
             }}
-            style={menuItemStyle()}
           >
             ✏️ 重命名符号 (F2)
-          </button>
-          <button
-            type="button"
+          </MenuItemButton>
+          <MenuItemButton
             onClick={() => {
               const view = viewRef.current
               setMenu(null)
               if (view === null) return
               void formatDocument(view, propsRef.current)
             }}
-            style={menuItemStyle()}
           >
             🎨 格式化文档 (Shift+Alt+F)
-          </button>
+          </MenuItemButton>
           <div style={{ height: 1, margin: '4px 8px', background: 'var(--ide-border,#e5e6eb)' }} />
           {menu.text.trim() !== '' && (
-            <button
-              type="button"
+            <MenuItemButton
               onClick={() => { const m = menu; setMenu(null); if (m !== null) onContextAction('ask-agent', m.text) }}
-              style={menuItemStyle()}
             >
               🤖 发送给 agent 分析/修改
-            </button>
+            </MenuItemButton>
           )}
           {menu.text.trim() !== '' && (
-            <button
-              type="button"
+            <MenuItemButton
               onClick={() => { const m = menu; setMenu(null); if (m !== null) onContextAction('copy', m.text) }}
-              style={menuItemStyle()}
             >
               📋 复制选中
-            </button>
+            </MenuItemButton>
           )}
         </div>,
         document.body,
@@ -771,14 +950,12 @@ function CodeMirrorPane({ tab, onContentChange, onSave, onContextAction, lsp, di
         >
           <div style={{ padding: '4px 14px', fontSize: 11, color: '#9ca3af' }}>快速修复</div>
           {actions.items.map((item) => (
-            <button
+            <MenuItemButton
               key={item.title}
-              type="button"
               onClick={() => { setActions(null); item.apply() }}
-              style={menuItemStyle()}
             >
               {item.title}
-            </button>
+            </MenuItemButton>
           ))}
         </div>,
         document.body,
@@ -955,12 +1132,18 @@ export function EditorPane({
   const [outputHeight, setOutputHeight] = useState(200)
   // 终端「立即 fit」触发器：手柄松手时 +1，TerminalPane 跳过防抖立即 fit+resize
   const [termFitTick, setTermFitTick] = useState(0)
-  // LSP：每 root 两个语言服务器客户端（ts = typescript-language-server，
-  // py = pyright），按当前文件类型选用；诊断按 uri 缓存（共享一个 map）。
+  // LSP：每 root 三个语言服务器客户端（ts = typescript-language-server，
+  // py = pyright，ps = PowerShell Editor Services），按当前文件类型选用；
+  // 诊断按 uri 缓存（共享一个 map）。
   const [tsLsp, setTsLsp] = useState<LspClient | null>(null)
   const [pyLsp, setPyLsp] = useState<LspClient | null>(null)
+  const [psLsp, setPsLsp] = useState<LspClient | null>(null)
   const [diagMap, setDiagMap] = useState<Map<string, LspDiagnostic[]>>(new Map())
-  const [lspStatus, setLspStatus] = useState('')
+  // LSP 状态按服务器分槽（ts/py/ps 各自独立）——避免一个服务器失败时
+  // 状态栏把错误盖到其他语言上（如 PSES 失败却显示在打开的 .ts 文件上）。
+  const [lspStatus, setLspStatus] = useState<{ ts?: string; py?: string; ps?: string }>({})
+  // 服务器完整错误日志（window/logMessage type 3），状态栏 hover 可见全文。
+  const [lspFullError, setLspFullError] = useState<Record<string, string>>({})
   // 状态栏：光标行列
   const [cursorPos, setCursorPos] = useState<{ line: number; column: number } | null>(null)
   // 编辑器字号（px）：Ctrl/Cmd+滚轮调整，localStorage 记忆（VS Code 习惯）。
@@ -972,25 +1155,63 @@ export function EditorPane({
     setEditorFontSize(size)
     localStorage.setItem('dsh-ide-editor-font-size', String(size))
   }
+  // GitLens 式行内 blame：按 1-based 行号升序；null = 无 blame（非仓库/未跟踪/超大文件）。
+  const [blame, setBlame] = useState<BlameLine[] | null>(null)
+  // 保存成功后 +1，触发重新拉取 blame（保存 = 提交前的内容变化）。
+  const [blameTick, setBlameTick] = useState(0)
+  // 整文件 gutter blame 开关（默认关：每行标注占空间；需要时工具栏「Blame」点开）。
+  // 状态栏光标行 blame 始终显示（一行信息，不占空间）。localStorage 记忆。
+  const [blameEnabled, setBlameEnabled] = useState(() => localStorage.getItem('dsh-ide-blame-enabled') === '1')
+  const toggleBlame = (): void => {
+    setBlameEnabled((enabled) => {
+      const next = !enabled
+      localStorage.setItem('dsh-ide-blame-enabled', next ? '1' : '0')
+      return next
+    })
+  }
+
+  // 拉取当前文件 blame：root / 文件 / 保存后 变化时重取。编辑中（dirty）不清
+  // 除则行号会与 blame 错位，由 onContentChange 处理（见 handleContentChange）。
+  useEffect(() => {
+    if (root === '' || activeTab === null || activeTab.truncated === true) {
+      setBlame(null)
+      return
+    }
+    if (activeTab.content.split('\n').length > BLAME_MAX_LINES) {
+      setBlame(null)
+      return
+    }
+    let cancelled = false
+    void apiGitBlame(root, activeTab.path).then((result) => {
+      if (cancelled) return
+      setBlame(result.ok ? result.value.lines : null)
+    })
+    return () => { cancelled = true }
+    // activeTab 是可变对象（content 随编辑更新），只依赖 path 避免每次按键重取
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [root, activeTab?.path, blameTick])
 
   // 当前文件的 LSP 客户端：仅对 languageIdForPath() 支持的语言返回客户端
-  // （ts = typescript-language-server / py = pyright），其余语言返回 null
+  // （ts / py / ps），其余语言返回 null
   // （P2-04：md/go/rust 等不再误拿 TS client）。
   const lspFor = (path: string): LspClient | null => {
     const language = languageIdForPath(path)
     if (language === null) return null
-    return language === 'python' ? pyLsp : tsLsp
+    if (language === 'python') return pyLsp
+    if (language === 'powershell') return psLsp
+    return tsLsp
   }
 
-  // 每 root 两个 LSP 会话：root 变化时重建（旧实例 dispose）。
+  // 每 root 三个 LSP 会话：root 变化时重建（旧实例 dispose）。
   useEffect(() => {
     if (root === '') {
       setTsLsp(null)
       setPyLsp(null)
+      setPsLsp(null)
       setDiagMap(new Map())
       return
     }
-    const makeClient = (server: 'ts' | 'py'): LspClient => new LspClient({
+    const makeClient = (server: 'ts' | 'py' | 'ps'): LspClient => new LspClient({
       root,
       rootUri: pathToUri(root, ''),
       server,
@@ -1003,22 +1224,31 @@ export function EditorPane({
         })
         onDiagnostics(uri, diagnostics)
       },
-      onOpen: () => setLspStatus('已连接'),
-      onFatal: (reason) => setLspStatus(`LSP 不可用: ${reason}`),
+      onOpen: () => setLspStatus((prev) => ({ ...prev, [server]: '已连接' })),
+      onFatal: (reason) => setLspStatus((prev) => ({ ...prev, [server]: `LSP 不可用: ${reason}` })),
+      onServerLog: (type, message) => {
+        // type 3 = Error：服务器失败时的完整 stderr，存起来供状态栏 hover 展示全文。
+        if (type === 3) setLspFullError((prev) => ({ ...prev, [server]: message }))
+      },
     })
     const ts = makeClient('ts')
     const py = makeClient('py')
+    const ps = makeClient('ps')
     setTsLsp(ts)
     setPyLsp(py)
+    setPsLsp(ps)
     setDiagMap(new Map())
-    setLspStatus('连接中…')
+    setLspStatus({ ts: '连接中…', py: '连接中…', ps: '连接中…' })
     ts.connect()
     py.connect()
+    ps.connect()
     return () => {
       ts.dispose()
       py.dispose()
+      ps.dispose()
       setTsLsp(null)
       setPyLsp(null)
+      setPsLsp(null)
     }
   }, [root])
 
@@ -1058,6 +1288,8 @@ export function EditorPane({
     if (result.ok) {
       onDirtySave({ ...tab, savedMtime: result.value.mtime })
       setStatus(`已保存 ${tab.path}`)
+      // 保存成功 → 重新拉取 blame（工作树变化后行归属可能改变）。
+      setBlameTick((tick) => tick + 1)
     } else {
       setStatus(`保存失败: ${result.error.message}`)
     }
@@ -1170,6 +1402,20 @@ export function EditorPane({
             {output?.state === 'running' ? '⏳ 运行中…' : '▶ 运行'}
           </button>
           <button
+            onClick={toggleBlame}
+            title={blameEnabled
+              ? '关闭行内 blame（每行的提交标注）'
+              : '开启行内 blame（每行显示 提交hash + 作者，悬停看详情）'}
+            style={{
+              padding: '4px 10px', fontSize: 12, cursor: 'pointer',
+              color: blameEnabled ? 'var(--ide-hl-keyword, #0000FF)' : '#9ca3af',
+              background: 'transparent', border: '1px solid var(--ide-border,#e5e6eb)',
+              borderRadius: 4, whiteSpace: 'nowrap',
+            }}
+          >
+            {blameEnabled ? '◉ Blame' : '○ Blame'}
+          </button>
+          <button
             onClick={onCloseEditor}
             title="关闭编辑区"
             style={{
@@ -1193,7 +1439,12 @@ export function EditorPane({
           <CodeMirrorPane
             key={activeTab.id}
             tab={activeTab}
-            onContentChange={onContentChange}
+            onContentChange={(id, content) => {
+              onContentChange(id, content)
+              // 编辑后行号与 blame 错位：清空 gutter 标注（保存后自动重取）。
+              // prev === null 时返回原引用，React bail out 不触发重渲染。
+              setBlame((prev) => (prev === null ? prev : null))
+            }}
             onSave={(tab) => requestSave(tab)}
             lsp={lspFor(activeTab.path)}
             diagnostics={diagMap.get(normalizeUri(pathToUri(root, activeTab.path))) ?? []}
@@ -1204,6 +1455,8 @@ export function EditorPane({
             onCursor={(line, column) => setCursorPos({ line, column })}
             fontSize={editorFontSize}
             onFontSizeChange={changeFontSize}
+            blame={blame}
+            blameEnabled={blameEnabled}
             onContextAction={(kind, text) => {
               if (kind === 'copy') {
                 void writeClipboard(text)
@@ -1297,16 +1550,38 @@ export function EditorPane({
       }}>
         <span style={{ display: 'flex', gap: 12, alignItems: 'center', overflow: 'hidden' }}>
           <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{root}</span>
-          {activeTab !== null && languageIdForPath(activeTab.path) !== null && (
-            <span title="语言服务器状态">
-              {lspStatus === '已连接' ? '✓ LSP' : lspStatus !== '' ? `… ${lspStatus}` : '… LSP'}
-            </span>
-          )}
+          {activeTab !== null && languageIdForPath(activeTab.path) !== null && (() => {
+            // 按当前文件语言显示对应语言服务器的状态（ts/py/ps 分槽，互不污染）。
+            const language = languageIdForPath(activeTab.path)
+            const server = language === 'python' ? 'py' : language === 'powershell' ? 'ps' : 'ts'
+            const status = lspStatus[server] ?? ''
+            return (
+              <span title={lspFullError[server] !== undefined ? lspFullError[server] : '语言服务器状态'}>
+                {status === '已连接' ? '✓ LSP' : status !== '' ? `… ${status}` : '… LSP'}
+              </span>
+            )
+          })()}
         </span>
         <span style={{ display: 'flex', gap: 12, alignItems: 'center', flexShrink: 0 }}>
           {activeTab !== null && (
             <>
               <span title="光标位置">{cursorPos !== null ? `行 ${cursorPos.line}, 列 ${cursorPos.column}` : ''}</span>
+              {(() => {
+                // GitLens 式光标行 blame：作者 · 相对时间 · 短 hash（未提交行显示「未提交」）。
+                if (blame === null || cursorPos === null) return null
+                const info = blame.find((item) => item.line === cursorPos.line)
+                if (info === undefined) return null
+                const short = shortHash(info.hash)
+                const label = short !== null ? `${info.author} · ${relativeTime(info.time)} · ${short}` : '未提交'
+                return (
+                  <span
+                    title={isUncommitted(info.hash) ? '工作区未提交改动' : `${info.summary}\n${info.hash}`}
+                    style={{ maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: '#9ca3af' }}
+                  >
+                    ◉ {label}
+                  </span>
+                )
+              })()}
               <span title={`编辑器字号（Ctrl+滚轮调整）: ${editorFontSize}px`}>{editorFontSize}px</span>
               <span title="语言">{languageIdForPath(activeTab.path) ?? 'plaintext'}</span>
               {(() => {

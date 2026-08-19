@@ -1,6 +1,12 @@
 # 依赖
 node_modules/
 
+# 外部语言服务器二进制（PSES，从 GitHub releases 手动更新）
+vendor/
+
+# PSES 运行时的 status 文件（写入当前工作目录）
+PowerShellEditorServices.json
+
 # 构建产物
 lib/
 *.tsbuildinfo

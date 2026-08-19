@@ -136,6 +136,22 @@ export function apiGitCommitDiff(root: string, hash: string): Promise<Envelope<s
   return post<string>('/dsh-ide/git/commit-diff', { root, hash })
 }
 
+/** One line's git blame info (1-based final line). */
+export interface BlameLine {
+  line: number
+  /** Full 40-char commit hash; all-zeros when the line is uncommitted. */
+  hash: string
+  author: string
+  mail: string
+  /** Author date as unix seconds. */
+  time: number
+  summary: string
+}
+
+export function apiGitBlame(root: string, path: string): Promise<Envelope<{ path: string; lines: BlameLine[] }>> {
+  return post<{ path: string; lines: BlameLine[] }>('/dsh-ide/git/blame', { root, path })
+}
+
 /** Subscribe to fs change events for one root (SSE). Returns a disposer. */
 export function subscribeChanges(root: string, onChange: () => void): () => void {
   const source = new EventSource(`/dsh-ide/events?root=${encodeURIComponent(root)}`)

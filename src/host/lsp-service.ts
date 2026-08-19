@@ -14,18 +14,43 @@
 
 import { spawn, type ChildProcess } from 'node:child_process'
 import { createRequire } from 'node:module'
+import { fileURLToPath } from 'node:url'
 import { type IncomingMessage } from 'node:http'
 import { WebSocket } from 'ws'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { FsService } from './fs-service.ts'
 import { languageIdForPath } from '../core/types.ts'
+import { closeWs } from './ws-safe.ts'
 
-/** Server kind → CLI entry (resolved from this plugin's node_modules). */
-const SERVER_ENTRIES: Record<string, string> = (() => {
+/**
+ * Server kind → 启动配置：命令 + 参数构造。
+ * - ts / py：Node 语言服务器（`process.execPath` 以 Node 模式跑 JS 入口，--stdio）。
+ * - ps：PowerShell Editor Services 不是 Node 程序，用 `pwsh` 跑捆绑在插件
+ *   vendor/ 的 Start-EditorServices.ps1（-Stdio 走标准输入输出，正合本桥）。
+ *   ⚠️ BundledModulesPath 必须指向「包含 PowerShellEditorServices 与
+ *   PSScriptAnalyzer 的父目录」（PSES 硬编码找 BundledModulesPath/PSScriptAnalyzer），
+ *   不是 PSES 自身目录——指错会导致分析器缺失、启动 CommandNotFound 退出。
+ *   vendor 从 GitHub releases / PSGallery 手动更新（.gitignore，不入库）。
+ *   ⚠️ 相对路径以**构建产物位置（lib/）**为基准：lib 在插件根下，用 '../vendor'
+ *   （= 插件根/vendor）；不要写 '../../vendor'——那是源码 src/host/ 的深度，
+ *   打包后运行在 lib/ 会多上跳一级指到父目录（实测 Start-EditorServices.ps1
+ *   找不到，PSES 直接 CommandNotFound 退出）。
+ */
+const SERVER_LAUNCHERS: Record<string, { command: string; args: () => string[] }> = (() => {
   const require = createRequire(import.meta.url)
+  const tsEntry = require.resolve('typescript-language-server/lib/cli.mjs')
+  const pyEntry = require.resolve('pyright/langserver.index.js')
+  const psBundle = fileURLToPath(new URL('../vendor', import.meta.url))
   return {
-    ts: require.resolve('typescript-language-server/lib/cli.mjs'),
-    py: require.resolve('pyright/langserver.index.js'),
+    ts: { command: process.execPath, args: () => [tsEntry, '--stdio'] },
+    py: { command: process.execPath, args: () => [pyEntry, '--stdio'] },
+    ps: {
+      command: 'pwsh',
+      args: () => [
+        '-NoLogo', '-NoProfile', '-Command',
+        `& '${psBundle}/PowerShellEditorServices/Start-EditorServices.ps1' -Stdio -HostName 'DSH IDE' -HostProfileId 'dsh-ide' -HostVersion '1.0.0' -BundledModulesPath '${psBundle}' -LogLevel Error`,
+      ],
+    },
   }
 })()
 
@@ -33,7 +58,9 @@ const SERVER_ENTRIES: Record<string, string> = (() => {
 export function lspServerForPath(path: string): string | null {
   const language = languageIdForPath(path)
   if (language === null) return null
-  return language === 'python' ? 'py' : 'ts'
+  if (language === 'python') return 'py'
+  if (language === 'powershell') return 'ps'
+  return 'ts'
 }
 
 /** P1-03：LSP 子进程并发上限 + 单帧大小上限（防资源耗尽）。 */
@@ -99,8 +126,8 @@ export function attachLspSocket(fs: FsService, req: IncomingMessage, ws: WebSock
         return
       }
       const server = url.searchParams.get('server') ?? 'ts'
-      const entry = SERVER_ENTRIES[server]
-      if (entry === undefined) {
+      const launcher = SERVER_LAUNCHERS[server]
+      if (launcher === undefined) {
         ws.close(1008, `unsupported server kind: ${server}`)
         return
       }
@@ -116,7 +143,7 @@ export function attachLspSocket(fs: FsService, req: IncomingMessage, ws: WebSock
       }
       lspActiveCount += 1
       const bridge: Bridge = {
-        child: spawn(process.execPath, [entry, '--stdio'], {
+        child: spawn(launcher.command, launcher.args(), {
           cwd: gated.canonical,
           // DSH Desktop 是 Electron 宿主：process.execPath 指向 DSH Desktop.exe，
           // 不设 ELECTRON_RUN_AS_NODE 会以 Electron GUI 模式启动脚本 → 立即退出。
@@ -139,12 +166,27 @@ export function attachLspSocket(fs: FsService, req: IncomingMessage, ws: WebSock
       })
       bridge.child.on('error', (error) => {
         bridge.exited = true
-        if (ws.readyState === WebSocket.OPEN) ws.close(1011, `language server error: ${error.message}`)
+        if (ws.readyState === WebSocket.OPEN) closeWs(ws, 1011, `language server error: ${error.message}`)
       })
       bridge.child.on('exit', (code, signal) => {
         bridge.exited = true
+        // 完整 stderr（去 ANSI 转义）进宿主日志——不截断，排查服务器启动失败
+        // 时能看到完整错误（ws reason 只有 123 字节装不下，靠这里留痕）。
+        if (bridge.stderrTail !== '') {
+          const clean = bridge.stderrTail.replace(/\u001b\[[0-9;]*m/g, '')
+          console.error(`[dsh-ide-lsp] ${server} exited (${signal ?? `code ${code ?? '?'}`}): ${clean}`)
+          // 把完整 stderr 经 WS 发给客户端（window/logMessage type 3），界面
+          // 悬停状态栏即可看到全文——close reason 的 123 字节截断只留一行。
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              jsonrpc: '2.0',
+              method: 'window/logMessage',
+              params: { type: 3, message: `[${server}] language server exited: ${clean}` },
+            }))
+          }
+        }
         if (ws.readyState === WebSocket.OPEN) {
-          ws.close(1011, `language server exited (${signal ?? `code ${code ?? '?'}`})${bridge.stderrTail !== '' ? `: ${bridge.stderrTail.trim().split('\n').pop() ?? ''}` : ''}`)
+          closeWs(ws, 1011, `language server exited (${signal ?? `code ${code ?? '?'}`})${bridge.stderrTail !== '' ? `: ${bridge.stderrTail.trim().split('\n').pop() ?? ''}` : ''}`)
         }
       })
       bridge.child.stdout.on('data', (chunk: Buffer) => {
@@ -202,7 +244,7 @@ export function attachLspSocket(fs: FsService, req: IncomingMessage, ws: WebSock
         }
       })
     } catch (error) {
-      ws.close(1011, error instanceof Error ? error.message : String(error))
+      closeWs(ws, 1011, error instanceof Error ? error.message : String(error))
     }
   })()
 }

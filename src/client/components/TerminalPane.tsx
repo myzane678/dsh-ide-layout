@@ -7,6 +7,7 @@
  *  retry. Reference: dsh-better-sidebar TerminalView (MIT), trimmed. */
 
 import { useEffect, useRef, useState, type JSX } from 'react'
+import { createPortal } from 'react-dom'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { XTERM_CSS } from '../xterm-css.ts'
@@ -45,6 +46,51 @@ function readThemeColor(el: HTMLElement | null, variable: string, fallback: stri
   }
 }
 
+/** 复制文本到剪贴板（含旧引擎 fallback）。 */
+async function copyText(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text)
+    return true
+  } catch {
+    try {
+      const area = document.createElement('textarea')
+      area.value = text
+      area.style.position = 'fixed'
+      area.style.opacity = '0'
+      document.body.appendChild(area)
+      area.select()
+      const ok = document.execCommand('copy')
+      area.remove()
+      return ok
+    } catch {
+      return false
+    }
+  }
+}
+
+/** 终端右键菜单项：hover 背景加深；disabled 置灰。 */
+function TermMenuItem({ onClick, disabled = false, children }: { onClick: () => void; disabled?: boolean; children: React.ReactNode }): JSX.Element {
+  const [hover, setHover] = useState(false)
+  return (
+    <button
+      type="button"
+      disabled={disabled}
+      onClick={onClick}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        display: 'block', width: '100%', textAlign: 'left', padding: '5px 14px',
+        border: 'none', fontSize: 13, fontFamily: 'inherit',
+        background: hover ? 'rgba(127,127,127,0.12)' : 'transparent',
+        color: disabled ? '#9ca3af' : 'inherit',
+        cursor: disabled ? 'default' : 'pointer',
+      }}
+    >
+      {children}
+    </button>
+  )
+}
+
 export function TerminalPane({ root, fitTick = 0 }: { root: string; fitTick?: number }): JSX.Element {
   const hostRef = useRef<HTMLDivElement | null>(null)
   const [connected, setConnected] = useState(false)
@@ -52,6 +98,12 @@ export function TerminalPane({ root, fitTick = 0 }: { root: string; fitTick?: nu
   const connectRef = useRef<(() => void) | null>(null)
   // 外部（面板拖拽结束）触发「立即 fit」，跳过防抖，松手即填充。
   const doFitRef = useRef<(() => void) | null>(null)
+  // 终端实例（右键菜单动作需要）+ 右键菜单位置。
+  const termRef = useRef<Terminal | null>(null)
+  const [termMenu, setTermMenu] = useState<{ x: number; y: number; hasSelection: boolean } | null>(null)
+  // 当前 WebSocket（重启终端动作需要发帧/断开）+ 主动重启标记（不累计连接失败）。
+  const socketRef = useRef<WebSocket | null>(null)
+  const restartingRef = useRef(false)
 
   useEffect(() => {
     if (fitTick === 0) return
@@ -108,6 +160,7 @@ export function TerminalPane({ root, fitTick = 0 }: { root: string; fitTick?: nu
     const connect = (): void => {
       if (closed) return
       socket = new WebSocket(wsUrl())
+      socketRef.current = socket
       socket.onopen = () => {
         failures = 0
         setConnected(true)
@@ -118,11 +171,19 @@ export function TerminalPane({ root, fitTick = 0 }: { root: string; fitTick?: nu
         if (typeof event.data === 'string') term.write(event.data)
       }
       socket.onclose = (event) => {
+        socketRef.current = null
         setConnected(false)
         // A server-side refusal carries a close code + reason; retrying it
         // forever would only spin the banner, so surface it with a retry.
         if (event.code === 1011 && event.reason !== '') {
           setFatal(event.reason)
+          return
+        }
+        // 主动重启（右键「重启终端」）：不累计失败，立即重连新 shell。
+        if (restartingRef.current) {
+          restartingRef.current = false
+          failures = 0
+          if (!closed) connect()
           return
         }
         failures += 1
@@ -194,6 +255,13 @@ export function TerminalPane({ root, fitTick = 0 }: { root: string; fitTick?: nu
     } catch {
       // Deferred: the next ResizeObserver tick will open it via fit().
     }
+    termRef.current = term
+    // 右键菜单：拦截浏览器默认菜单，按选中态提供 复制/粘贴/清屏。
+    const onTermContextMenu = (event: MouseEvent): void => {
+      event.preventDefault()
+      setTermMenu({ x: event.clientX, y: event.clientY, hasSelection: term.hasSelection() })
+    }
+    host.addEventListener('contextmenu', onTermContextMenu)
 
     connect()
     return () => {
@@ -204,6 +272,8 @@ export function TerminalPane({ root, fitTick = 0 }: { root: string; fitTick?: nu
       observer.disconnect()
       inputSub.dispose()
       doFitRef.current = null
+      host.removeEventListener('contextmenu', onTermContextMenu)
+      termRef.current = null
       // 面板隐藏/卸载：只断开 socket（host 侧宽限期后回收 shell）。
       // 不主动发 close frame——同一 root 快速重开可复用同一个 shell。
       socket?.close()
@@ -212,8 +282,71 @@ export function TerminalPane({ root, fitTick = 0 }: { root: string; fitTick?: nu
     }
   }, [root])
 
+  // 复制终端选中文本（xterm 选区）。
+  const copySelection = (): void => {
+    const term = termRef.current
+    const menu = termMenu
+    setTermMenu(null)
+    if (term === null || menu === null || !menu.hasSelection) return
+    void copyText(term.getSelection())
+  }
+
+  // 从剪贴板粘贴到终端（term.paste 走 WS 当键盘输入发给 shell）。
+  const pasteClipboard = (): void => {
+    const menu = termMenu
+    setTermMenu(null)
+    if (menu === null) return
+    void navigator.clipboard.readText()
+      .then((text) => { if (text !== '') termRef.current?.paste(text) })
+      .catch(() => { console.error('[dsh-ide-layout] 剪贴板读取失败（无 clipboard-read 权限）') })
+  }
+
+  // 清空终端视口与滚动缓冲（纯前端，不打扰 shell）。
+  const clearTerminal = (): void => {
+    setTermMenu(null)
+    termRef.current?.clear()
+  }
+
+  // 重启终端：立即杀当前 shell + 重连全新 shell（不用重启整个 harness）。
+  const restartTerminal = (): void => {
+    const menu = termMenu
+    setTermMenu(null)
+    if (menu === null) return
+    termRef.current?.clear()
+    restartingRef.current = true
+    const socket = socketRef.current
+    if (socket !== null && socket.readyState === WebSocket.OPEN) {
+      // 通知 host 立即回收 shell；随后断开，onclose 走「主动重启」分支立即重连。
+      socket.send(JSON.stringify({ type: 'restart' }))
+      socket.close()
+    } else {
+      // 连接已断开：直接重连（open 会 spawn 全新 shell）。
+      connectRef.current?.()
+    }
+  }
+
+  // 关闭右键菜单：外部点击或 Esc。
+  useEffect(() => {
+    if (termMenu === null) return
+    const onDown = (event: MouseEvent): void => {
+      const target = event.target as HTMLElement | null
+      if (target !== null && target.closest('[data-ide-term-menu]') !== null) return
+      setTermMenu(null)
+    }
+    const onKey = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') setTermMenu(null)
+    }
+    window.addEventListener('mousedown', onDown)
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('mousedown', onDown)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [termMenu])
+
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
+    <>
+      <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
       {fatal !== null && (
         <div style={{
           padding: '5px 10px', fontSize: 12, color: '#dc2626',
@@ -238,6 +371,31 @@ export function TerminalPane({ root, fitTick = 0 }: { root: string; fitTick?: nu
         <div style={{ padding: '2px 10px', fontSize: 11, color: '#9ca3af', flexShrink: 0 }}>连接中…</div>
       )}
       <div ref={hostRef} style={{ flex: 1, minHeight: 0 }} />
-    </div>
+      </div>
+      {/* 终端右键菜单（复制/粘贴/清屏） */}
+      {termMenu !== null && createPortal(
+        <div
+          data-ide-term-menu=""
+          style={{
+            position: 'fixed', left: Math.max(4, Math.min(termMenu.x, window.innerWidth - 180)),
+            top: Math.max(4, Math.min(termMenu.y, window.innerHeight - 160)),
+            zIndex: 1100, minWidth: 160, padding: '4px 0',
+            // 浮层用 overlay + label-primary 自足背景（皮肤透明化 bg-base 时仍可读）。
+            background: 'var(--dsw-alias-bg-overlay, rgba(248,250,255,0.98))',
+            color: 'var(--dsw-alias-label-primary, #1a1a1a)',
+            border: '1px solid var(--ide-border,#e5e6eb)', borderRadius: 6,
+            boxShadow: '0 8px 24px rgba(0,0,0,0.28)', fontSize: 13, fontFamily: 'inherit',
+          }}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          <TermMenuItem onClick={copySelection} disabled={!termMenu.hasSelection}>📋 复制选中</TermMenuItem>
+          <TermMenuItem onClick={pasteClipboard}>📥 粘贴</TermMenuItem>
+          <div style={{ height: 1, margin: '4px 8px', background: 'var(--ide-border,#e5e6eb)' }} />
+          <TermMenuItem onClick={clearTerminal}>🧹 清屏</TermMenuItem>
+          <TermMenuItem onClick={restartTerminal}>🔄 重启终端</TermMenuItem>
+        </div>,
+        document.body,
+      )}
+    </>
   )
 }

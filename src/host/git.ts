@@ -11,7 +11,7 @@
  */
 import { spawn } from 'node:child_process'
 import { readdir, stat, realpath } from 'node:fs/promises'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 /** A parsed `git status --porcelain=v1 -z` entry. */
 export interface GitStatusEntry {
@@ -171,6 +171,26 @@ export async function findRepos(root: string, maxDepth = 5): Promise<string[]> {
   return found
 }
 
+/**
+ * Find the nearest git repository root containing a file, walking upward from
+ * the file's directory. Used by blame when the workspace root is only a parent
+ * directory (e.g. a multi-repo workspace) — the file belongs to a nested repo
+ * that `git -C <root>` cannot see. Returns null when no ancestor has `.git`.
+ */
+export async function findRepoRootForFile(absPath: string): Promise<string | null> {
+  let dir = dirname(absPath)
+  for (;;) {
+    try {
+      await stat(join(dir, '.git'))
+      return dir
+    } catch {
+      const parent = dirname(dir)
+      if (parent === dir) return null
+      dir = parent
+    }
+  }
+}
+
 /** The repository top level containing `cwd` (`git rev-parse --show-toplevel`). */
 export async function repoRoot(cwd: string): Promise<string> {
   const out = await runGit(cwd, ['rev-parse', '--show-toplevel'])
@@ -290,4 +310,83 @@ export async function revert(cwd: string, hash: string): Promise<void> {
 /** Cherry-pick one commit onto the current branch. */
 export async function cherryPick(cwd: string, hash: string): Promise<void> {
   await runGit(cwd, ['cherry-pick', hash])
+}
+
+/** One line's git blame info (final line numbers, 1-based). */
+export interface GitBlameLine {
+  /** 1-based line number in the blamed file. */
+  line: number
+  /** Full 40-char commit hash; all-zeros when the line is uncommitted. */
+  hash: string
+  /** Author name ('' when unavailable). */
+  author: string
+  /** Author email ('' when unavailable). */
+  mail: string
+  /** Author date as unix seconds; 0 when unavailable. */
+  time: number
+  /** Commit subject ('' for uncommitted lines). */
+  summary: string
+}
+
+/**
+ * Parse `git blame --porcelain` output into per-line entries.
+ *
+ * Porcelain format groups rows per commit: a block header line
+ * `<sha> <orig-lineno> <final-lineno> <num-lines>` is followed by header
+ * fields (`author`, `author-mail`, `author-time`, `summary`, …) and then
+ * `num-lines` body lines (`\t<content>`). Each body line maps to the
+ * consecutive result line starting at `final-lineno`. Uncommitted lines
+ * carry an all-zero sha.
+ */
+export function parseBlamePorcelain(output: string): GitBlameLine[] {
+  const lines: GitBlameLine[] = []
+  let current: { hash: string; author: string; mail: string; time: number; summary: string } | null = null
+  let resultLine = 0
+  let remaining = 0
+  for (const raw of output.split('\n')) {
+    // 内容区：porcelain 的内容行总是以 \t 开头（header 字段行不是），
+    // 所以用 remaining + \t 双重判定，header 行不会被误消费。
+    if (remaining > 0 && raw.startsWith('\t')) {
+      lines.push({
+        line: resultLine,
+        hash: current?.hash ?? '',
+        author: current?.author ?? '',
+        mail: current?.mail ?? '',
+        time: current?.time ?? 0,
+        summary: current?.summary ?? '',
+      })
+      resultLine += 1
+      remaining -= 1
+      continue
+    }
+    const header = /^([0-9a-f]{40}) (\d+) (\d+) (\d+)$/.exec(raw)
+    if (header !== null) {
+      current = { hash: header[1]!, author: '', mail: '', time: 0, summary: '' }
+      resultLine = Number.parseInt(header[3]!, 10)
+      remaining = Number.parseInt(header[4]!, 10)
+      continue
+    }
+    if (current === null) continue
+    if (raw.startsWith('author ')) current.author = raw.slice(7)
+    else if (raw.startsWith('author-mail ')) current.mail = raw.slice(12).replace(/[<>]/g, '')
+    else if (raw.startsWith('author-time ')) {
+      const time = Number.parseInt(raw.slice(12), 10)
+      if (Number.isFinite(time)) current.time = time
+    } else if (raw.startsWith('summary ')) current.summary = raw.slice(8)
+  }
+  return lines
+}
+
+/**
+ * Per-line git blame of one path (working tree vs HEAD). Returns [] when the
+ * path is untracked, the directory is not inside a repo, or git fails — the
+ * caller treats an empty list as "no blame available" (never an error).
+ */
+export async function blame(cwd: string, path: string): Promise<GitBlameLine[]> {
+  try {
+    const raw = await runGit(cwd, ['blame', '--porcelain', '--', path])
+    return parseBlamePorcelain(raw)
+  } catch {
+    return []
+  }
 }

@@ -48,6 +48,7 @@ export function languageIdForPath(path: string): string | null {
     case 'tsx': return 'typescriptreact'
     case 'json': case 'jsonc': case 'map': return 'json'
     case 'py': case 'pyw': return 'python'
+    case 'ps1': case 'psm1': case 'psd1': return 'powershell'
     default: return null
   }
 }

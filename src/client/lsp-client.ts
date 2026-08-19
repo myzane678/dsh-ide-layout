@@ -152,10 +152,12 @@ export interface LspClientOptions {
   root: string
   /** The file:// URI the server should treat as the workspace root. */
   rootUri: string
-  /** 语言服务器类型：'ts'（typescript-language-server）或 'py'（pyright）。 */
-  server?: 'ts' | 'py'
+  /** 语言服务器类型：'ts'（typescript-language-server）/ 'py'（pyright）/ 'ps'（PowerShell Editor Services）。 */
+  server?: 'ts' | 'py' | 'ps'
   /** 诊断回调：uri 已归一化（与 pathToUri 输出一致，Windows 盘符小写化）。 */
   onDiagnostics: (uri: string, diagnostics: LspDiagnostic[]) => void
+  /** 服务器主动日志（window/logMessage，如退出时的完整 stderr）。type: 3=Error。 */
+  onServerLog?: (type: number, message: string) => void
   /** Server process died / connection refused permanently. */
   onFatal?: (reason: string) => void
   onOpen?: () => void
@@ -438,6 +440,13 @@ export class LspClient {
           // 服务器返回的 uri 可能带百分号编码（Windows 冒号 → %3A），归一化后
           // 与 pathToUri 输出对齐，EditorPane 才能按 pathToUri(root, path) 查到。
           this.options.onDiagnostics(normalizeUri(params.uri), params.diagnostics ?? [])
+        }
+      }
+      // 服务器主动日志（如退出时的完整 stderr）——上抛给界面展示完整错误。
+      if (message.method === 'window/logMessage') {
+        const params = message.params as { type?: number; message?: string } | undefined
+        if (params?.message !== undefined) {
+          this.options.onServerLog?.(params.type ?? 0, params.message)
         }
       }
       this.notifications.get(message.method)?.(message.params)

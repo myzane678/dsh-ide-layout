@@ -14,12 +14,14 @@ DSH（DeepSeek Harness）Web GUI 的 IDE 布局插件：左侧工作区文件树
 - 右键快速修复、Tab 接受补全
 - 保存：Ctrl+S 快捷键 + tab 栏「💾 保存」按钮（有未保存更改时可用，状态栏反馈）
 - 字号缩放：Ctrl/Cmd + 滚轮调整编辑器字号（9–24px，localStorage 记忆，状态栏显示当前字号）
+- **GitLens 式行内 blame**：工具栏「○ Blame」开关（默认关，localStorage 记忆）→ 编辑器左侧 gutter 逐行标注「短 hash + 作者」，悬停浮层显示完整提交信息；状态栏光标行始终显示「◉ 作者 · 相对时间 · 短 hash」；工作区根非 Git 仓库时自动定位嵌套子仓库；未启用/编辑中整列不渲染
 
 ### LSP（语言服务器协议）
-> 仅对支持的语言启用（P2-04）：语法高亮覆盖 23 种格式，但 LSP 智能能力（补全/诊断/悬停/跳转/重命名等）只面向以下两种语言，其余语言为纯高亮。
+> 仅对支持的语言启用（P2-04）：语法高亮覆盖 23 种格式，但 LSP 智能能力（补全/诊断/悬停/跳转/重命名等）只面向以下三种语言，其余语言为纯高亮。
 
 - TypeScript / JavaScript：`typescript-language-server` 5.3.0
 - Python：`pyright` 1.1.413
+- PowerShell：**PowerShell Editor Services 4.7.0 + PSScriptAnalyzer**（`.ps1`/`.psm1`/`.psd1`；捆绑模块位于插件 `vendor/`，从 GitHub releases / PSGallery 手动更新，不入 git 仓库）
 - 宿主进程为每个 WebSocket 连接启动一个语言服务器子进程（stdio ↔ WS 透传）
 - ⚠️ Electron 宿主必须设置 `ELECTRON_RUN_AS_NODE=1`
 - 终端 / LSP WebSocket 与 HTTP 路由同级校验：仅接受本机 loopback + 同源 Origin 的连接
@@ -35,6 +37,7 @@ DSH（DeepSeek Harness）Web GUI 的 IDE 布局插件：左侧工作区文件树
 - xterm 5.5 + node-pty，每个 root 一个 shell
 - 拖拽调整高度（DOM 直改 + rAF 实时 fit，无抖动）
 - 30s 重连宽限
+- 右键菜单：复制选中 / 粘贴 / 清屏 / **🔄 重启终端**（立即杀当前 shell 并重连全新 shell，无需重启 DSH）
 
 ### Git 面板
 - status / diff / stage / unstage / commit / discard / log + 提交历史 diff
@@ -86,6 +89,8 @@ dsh plugin --profile desktop add "dsh-ide-layout@git+https://github.com/myzane67
 ```
 
 > **⚠️ 重要**：本插件**不是纯静态前端插件**——它依赖本地宿主能力（workspace 门控文件系统、`/dsh-ide/*` 路由、终端/LSP 子进程、脚本运行）。必须安装在 **desktop profile**（web profile 只有浏览器半区，缺少宿主服务无法工作）。
+
+> **PowerShell 智能依赖 `vendor/` 捆绑**：PowerShell 语言服务器（PSES 4.7.0）与 PSScriptAnalyzer 位于插件 `vendor/` 目录，**不入 git 仓库**（本地开发/`link:` 安装时已存在）。`git+` 安装后若需 PowerShell 支持，请从本仓库的 [GitHub Releases](https://github.com/myzane678/dsh-ide-layout/releases) 下载 `dsh-ide-layout-vendor-pses.zip`，解压到插件目录 `vendor/`（结构：`vendor/PowerShellEditorServices/` + `vendor/PSScriptAnalyzer/`），重启 DSH 生效。TypeScript / Python 智能不依赖 vendor，开箱即用。
 
 安装后重启 DSH（或刷新 GUI 页面）生效。之后更新插件只需在 profile 目录执行：
 

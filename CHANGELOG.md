@@ -2,6 +2,22 @@
 
 本项目版本与更新记录。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.2.0] - 2026-08-20
+
+### 新增
+
+- **GitLens 式行内 blame**：编辑器左侧 gutter 逐行标注「短 hash + 作者」（未提交行显示「未提交」），悬停浮层显示完整提交信息（提交/作者/日期/说明）；状态栏光标行显示「◉ 作者 · 相对时间 · 短 hash」；嵌套仓库自动定位（工作区根非 Git 仓库时从文件向上找最近仓库根）；整文件标注默认关闭（工具栏「○ Blame」开关，localStorage 记忆，未启用时整列不渲染）
+- **PowerShell 语言智能**（PowerShell Editor Services v4.7.0 + PSScriptAnalyzer）：`.ps1` / `.psm1` / `.psd1` 的补全、悬停帮助、实时语义分析（Script Analyzer 波浪线）、跳转定义、格式化、重命名、快速修复；捆绑模块放在插件 `vendor/` 目录（从 GitHub releases / PSGallery 手动更新，不入 git 仓库）
+- **终端右键菜单**：复制选中 / 粘贴 / 清屏 / **🔄 重启终端**（立即杀掉当前 shell 并重连全新 shell，无需重启 DSH）
+- 编辑器右键菜单选项悬停背景加深
+
+### 修复
+
+- **PowerShell 语言服务器启动路径 bug**：`vendor` 相对路径按源码位置推导、打包后在 `lib/` 多上跳一级导致找不到 `Start-EditorServices.ps1`（报「命令不存在」）——改为以构建产物位置为基准
+- **WebSocket 关闭闪退**：close reason 超过协议 123 字节上限时 ws 库抛错导致宿主进程退出（DSH 整体闪退）——新增 `closeWs()` 统一按 UTF-8 字节截断，覆盖语言服务器与终端全部关闭点
+- **LSP 状态栏按服务器分槽**（ts / py / ps 各自独立），一个语言服务器失败不再污染其他语言的状态显示；服务器退出时完整 stderr 经 `window/logMessage` 发到界面（状态栏悬停可见全文，不再截断）
+- **高亮配色去红**：字符串改暖棕、非法字符改中性灰、符号类兜底主文字色——普通高亮不再出现红色，红色只留给 LSP 诊断的红色下波浪线（错误语义唯一来源）
+
 ## [0.1.0] - 2026-08-19
 
 - 初始发布：DSH Web GUI IDE 布局插件
