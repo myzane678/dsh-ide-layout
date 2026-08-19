@@ -2,7 +2,12 @@
 
 本项目版本与更新记录。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
-## [Unreleased]
+## [0.1.0] - 2026-08-19
+
+- 初始发布：DSH Web GUI IDE 布局插件
+- 文件树（flex 流嵌入、懒加载、右键菜单、拖拽调高）
+- CodeMirror 6 编辑器 + LSP（TypeScript / Python，补全/诊断/悬停/跳转/重命名/格式化/快速修复）
+- xterm 终端（node-pty）+ Git 面板 + 问题面板 + 脚本运行输出
 
 ### 安全修复（审查整改，2026-08-18）
 
@@ -36,10 +41,3 @@
 - 语法高亮扩展：YAML / XML / SQL / Java / C/C++ / Rust / Go / PHP / Vue / SCSS / LESS / TOML / Batch（.cmd/.bat，自写 StreamParser）/ PowerShell / Shell（共 23 种格式）
 - Markdown 高亮补充标题/强调/链接/引用/删除线配色
 - 一键安装：`dsh plugin --profile desktop add "dsh-ide-layout@git+https://github.com/myzane678/dsh-ide-layout.git"`（`prepare` 自动构建）
-
-## [0.1.0] - 2026-08-18
-
-- 初始发布：DSH Web GUI IDE 布局插件
-- 文件树（flex 流嵌入、懒加载、右键菜单、拖拽调高）
-- CodeMirror 6 编辑器 + LSP（TypeScript / Python，补全/诊断/悬停/跳转/重命名/格式化/快速修复）
-- xterm 终端（node-pty）+ Git 面板 + 问题面板 + 脚本运行输出
