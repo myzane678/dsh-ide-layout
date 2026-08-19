@@ -90,8 +90,11 @@ export function GitPanel({ root }: GitPanelProps): JSX.Element {
   // Keep the freshest target in a ref so refresh() can switch repos without
   // recreating the callback (avoids a render loop via the root effect below).
   const activeRepoRef = useRef('')
+  /** P2-03：repo 代际标记——切换 repo/root 后旧请求响应丢弃，防串面板。 */
+  const repoGen = useRef(0)
   const pickRepo = (path: string): void => {
     activeRepoRef.current = path
+    repoGen.current += 1
     setActiveRepo(path)
   }
 
@@ -103,7 +106,9 @@ export function GitPanel({ root }: GitPanelProps): JSX.Element {
   const refresh = useCallback((): void => {
     const target = activeRepoRef.current !== '' ? activeRepoRef.current : root
     if (target === '') return
+    const gen = repoGen.current
     void apiGitStatus(target).then((result) => {
+      if (gen !== repoGen.current) return
       if (result.ok) {
         setStatus(result.value)
         setError(null)
@@ -111,6 +116,7 @@ export function GitPanel({ root }: GitPanelProps): JSX.Element {
         // the first one so the panel still shows git state for sub-projects.
         if (!result.value.isRepo && activeRepoRef.current === '') {
           void apiGitRepos(root).then((reposResult) => {
+            if (gen !== repoGen.current) return
             if (reposResult.ok && reposResult.value.length > 0) {
               setRepos(reposResult.value)
               pickRepo(reposResult.value[0]!.path)
@@ -133,6 +139,7 @@ export function GitPanel({ root }: GitPanelProps): JSX.Element {
     setCommitDiff(null)
     setRepos([])
     activeRepoRef.current = ''
+    repoGen.current += 1
     setActiveRepo('')
     refresh()
   }, [root, refresh])
@@ -162,7 +169,9 @@ export function GitPanel({ root }: GitPanelProps): JSX.Element {
   }
 
   const viewDiff = (path: string, staged: boolean): void => {
+    const gen = repoGen.current
     void apiGitDiff(gitRoot, path, staged).then((result) => {
+      if (gen !== repoGen.current) return
       if (result.ok) setDiff({ path, staged, text: result.value })
       else setError(result.error.message)
     })
@@ -179,7 +188,9 @@ export function GitPanel({ root }: GitPanelProps): JSX.Element {
     const next = !showLog
     setShowLog(next)
     if (next && log === null) {
+      const gen = repoGen.current
       void apiGitLog(gitRoot, 20).then((result) => {
+        if (gen !== repoGen.current) return
         if (result.ok) setLog(result.value)
         else setError(result.error.message)
       })
@@ -251,7 +262,9 @@ export function GitPanel({ root }: GitPanelProps): JSX.Element {
                         return
                       }
                       setCommitDiff({ hash: entry.hash, text: '加载中…' })
+                      const gen = repoGen.current
                       void apiGitCommitDiff(gitRoot, entry.hash).then((result) => {
+                        if (gen !== repoGen.current) return
                         setCommitDiff(result.ok
                           ? { hash: entry.hash, text: result.value }
                           : { hash: entry.hash, text: `加载失败: ${result.error.message}` })

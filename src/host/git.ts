@@ -10,7 +10,7 @@
  * user.name/user.email).
  */
 import { spawn } from 'node:child_process'
-import { readdir, stat } from 'node:fs/promises'
+import { readdir, stat, realpath } from 'node:fs/promises'
 import { join } from 'node:path'
 
 /** A parsed `git status --porcelain=v1 -z` entry. */
@@ -175,6 +175,23 @@ export async function findRepos(root: string, maxDepth = 5): Promise<string[]> {
 export async function repoRoot(cwd: string): Promise<string> {
   const out = await runGit(cwd, ['rev-parse', '--show-toplevel'])
   return out.trim()
+}
+
+/**
+ * Canonical (realpath'd) repository root containing `cwd`, or null when `cwd`
+ * is not inside any git repo. Used for P0-03: git resolves the repo upward
+ * from any subdirectory, so we must verify that a requested root IS the repo
+ * top level before running commands that could touch the parent repo.
+ */
+export async function repoTopLevel(cwd: string): Promise<string | null> {
+  try {
+    const out = await runGit(cwd, ['rev-parse', '--show-toplevel'])
+    const top = out.trim()
+    if (top === '') return null
+    return await realpath(top)
+  } catch {
+    return null
+  }
 }
 
 /** The current branch name (`git rev-parse --abbrev-ref HEAD`; 'HEAD' when detached). */

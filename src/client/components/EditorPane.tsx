@@ -6,7 +6,7 @@ import { useEffect, useRef, useState, type JSX } from 'react'
 import { createPortal } from 'react-dom'
 import { basicSetup } from 'codemirror'
 import { EditorView, hoverTooltip, keymap, type Tooltip } from '@codemirror/view'
-import { Prec, type Extension, type Text } from '@codemirror/state'
+import { Prec, EditorState, type Extension, type Text } from '@codemirror/state'
 import { HighlightStyle, syntaxHighlighting } from '@codemirror/language'
 import { tags as t } from '@lezer/highlight'
 import { autocompletion, acceptCompletion, type CompletionContext, type CompletionResult } from '@codemirror/autocomplete'
@@ -337,8 +337,11 @@ async function applyWorkspaceEdit(
         ? decoded.slice(rootUri.length).replace(/^[\\/]/, '')
         : null
       if (rel === null || rel === '') continue
+      // P1-07：跨文件写入必须带读取时的 baseMtime（冲突检测），且拒绝截断/二进制文件
+      // —— 防止静默覆盖外部工具刚写入的内容。
       const read = await apiRead(props.root, rel)
       if (!read.ok) continue
+      if (read.value.truncated === true) continue
       const sorted = [...change.edits].sort((a, b) => b.range.start.line - a.range.start.line || b.range.start.character - a.range.start.character)
       let content = read.value.content
       const lines = content.split('\n')
@@ -349,8 +352,8 @@ async function applyWorkspaceEdit(
         content = content.slice(0, start) + textEdit.newText + content.slice(end)
         lines.splice(0, lines.length, ...content.split('\n'))
       }
-      await apiWrite(props.root, rel, content)
-      touched += 1
+      const written = await apiWrite(props.root, rel, content, read.value.mtime)
+      if (written.ok) touched += 1
     }
   }
   return touched
@@ -475,6 +478,10 @@ function CodeMirrorPane({ tab, onContentChange, onSave, onContextAction, lsp, di
           },
           '&.cm-focused': { outline: 'none' },
         }),
+        // P1-04：截断文件只读（readOnly 扩展禁止编辑与输入）。
+        ...(propsRef.current.tab.truncated === true
+          ? [EditorState.readOnly.of(true), EditorView.editable.of(false)]
+          : []),
         Prec.highest(keymap.of([
           {
             key: 'Mod-s',
@@ -640,6 +647,14 @@ function CodeMirrorPane({ tab, onContentChange, onSave, onContextAction, lsp, di
 
   return (
     <>
+      {tab.truncated === true && (
+        <div style={{
+          flexShrink: 0, padding: '4px 10px', fontSize: 12, color: '#b45309',
+          background: 'rgba(245,158,11,0.12)', borderBottom: '1px solid rgba(245,158,11,0.3)',
+        }}>
+          ⚠ 文件过大已截断显示（只读，禁止保存，防止覆盖尾部内容）
+        </div>
+      )}
       <div
         ref={hostRef}
         style={{ flex: 1, minHeight: 0, overflow: 'hidden', ['--ide-editor-font-size' as string]: `${fontSize}px` }}
@@ -952,9 +967,12 @@ export function EditorPane({
     localStorage.setItem('dsh-ide-editor-font-size', String(size))
   }
 
-  // 当前文件的 LSP 客户端：python → py，其余 → ts。
+  // 当前文件的 LSP 客户端：仅对 languageIdForPath() 支持的语言返回客户端
+  // （ts = typescript-language-server / py = pyright），其余语言返回 null
+  // （P2-04：md/go/rust 等不再误拿 TS client）。
   const lspFor = (path: string): LspClient | null => {
     const language = languageIdForPath(path)
+    if (language === null) return null
     return language === 'python' ? pyLsp : tsLsp
   }
 
@@ -1023,6 +1041,13 @@ export function EditorPane({
 
   /** 保存并返回是否成功（供「运行前保存」与 Ctrl+S 共用）。 */
   const saveNow = async (tab: EditorTab): Promise<boolean> => {
+    // P1-04：截断文件只读，禁止保存（防尾部数据被覆盖丢失）。
+    if (tab.truncated === true) {
+      setStatus(`⚠ ${tab.path} 过大已被截断，只读不可保存`)
+      if (saveTimer.current !== undefined) clearTimeout(saveTimer.current)
+      saveTimer.current = setTimeout(() => setStatus(''), 4000)
+      return false
+    }
     const result = await apiWrite(root, tab.path, tab.content, tab.savedMtime)
     if (result.ok) {
       onDirtySave({ ...tab, savedMtime: result.value.mtime })
@@ -1039,9 +1064,14 @@ export function EditorPane({
     void saveNow(tab)
   }
 
-  /** 运行当前文件：先保存（若 dirty），再交给 host 执行并展示输出面板。 */
+  /** 运行当前文件：先保存（若 dirty），再交给 host 执行并展示输出面板。
+   *  P1-02：首次运行时确认（localStorage 记忆），运行是本机高权限执行入口。 */
   const runActive = async (): Promise<void> => {
     if (activeTab === null || output?.state === 'running') return
+    if (localStorage.getItem('dsh-ide-run-confirmed') !== '1') {
+      if (!window.confirm('运行将在本机执行脚本（node/python/pwsh）。确认允许运行？')) return
+      localStorage.setItem('dsh-ide-run-confirmed', '1')
+    }
     if (activeTab.dirty && !(await saveNow(activeTab))) {
       setOutput({ state: 'done', error: '保存失败，已取消运行', result: EMPTY_RUN })
       return
@@ -1294,21 +1324,21 @@ export function EditorPane({
   )
 }
 
-/** Open a file into the editor store (async load). */
+/**
+ * Open a file into the editor store (async load).
+ * P1-06: uses a functional updater so a late-returning read merges into the
+ * latest tab list instead of overwriting newer tabs (fast-open A, B → A's
+ * stale snapshot must not drop B). P1-04: a truncated file is opened
+ * read-only so the tail cannot be clobbered by a save.
+ */
 export async function openFileInTabs(
   root: string,
   path: string,
-  tabs: EditorTab[],
-  activeTabId: string | null,
-  onUpdate: (tabs: EditorTab[], active: string | null) => void,
+  onUpdate: (updater: (prev: { tabs: EditorTab[]; activeTabId: string | null }) => { tabs: EditorTab[]; activeTabId: string | null }) => void,
 ): Promise<void> {
-  const existing = tabs.find((tab) => tab.path === path)
-  if (existing !== undefined) {
-    onUpdate(tabs, existing.id)
-    return
-  }
   const result = await apiRead(root, path)
   if (!result.ok) return
+  const truncated = result.value.truncated === true
   const tab: EditorTab = {
     id: `file:${path}`,
     path,
@@ -1316,6 +1346,12 @@ export async function openFileInTabs(
     content: result.value.content,
     dirty: false,
     savedMtime: result.value.mtime,
+    truncated,
   }
-  onUpdate([...tabs, tab], tab.id)
+  onUpdate((prev) => {
+    // 已存在（并发打开同一文件）→ 只激活不覆盖。
+    const existing = prev.tabs.find((item) => item.path === path)
+    if (existing !== undefined) return { tabs: prev.tabs, activeTabId: existing.id }
+    return { tabs: [...prev.tabs, tab], activeTabId: tab.id }
+  })
 }

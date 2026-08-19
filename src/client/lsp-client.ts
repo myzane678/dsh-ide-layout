@@ -313,7 +313,7 @@ export class LspClient {
     this.socket.send(JSON.stringify(message))
   }
 
-  /** Fire a JSON-RPC request and await the result. */
+  /** Fire a JSON-RPC request and await the result (10s timeout). */
   request(method: string, params: unknown): Promise<unknown> {
     return new Promise((resolve, reject) => {
       if (this.socket === null || this.socket.readyState !== WebSocket.OPEN) {
@@ -321,7 +321,14 @@ export class LspClient {
         return
       }
       const id = this.nextId++
-      this.pending.set(id, { resolve, reject })
+      const timer = window.setTimeout(() => {
+        this.pending.delete(id)
+        reject(new Error(`LSP request timed out: ${method}`))
+      }, 10_000)
+      this.pending.set(id, {
+        resolve: (value) => { window.clearTimeout(timer); resolve(value) },
+        reject: (error) => { window.clearTimeout(timer); reject(error) },
+      })
       const message: RpcMessage = { jsonrpc: '2.0', id, method, params }
       this.socket.send(JSON.stringify(message))
     })
@@ -483,7 +490,10 @@ export class LspClient {
       }
       this.options.onOpen?.()
     } catch {
-      // Initialize failed; the close handler will drive reconnection.
+      // P1-03：初始化失败 → 主动关闭 socket（触发带退避的 onclose 重连），
+      // 绝不保留「OPEN 但未初始化」的假连接。
+      this.socket?.close()
+      this.socket = null
     }
   }
 

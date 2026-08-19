@@ -13,6 +13,7 @@ import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { PanelError } from '../core/types.ts'
 import type { FsService } from './fs-service.ts'
 import * as git from './git.ts'
+import { isLoopbackRequest } from './security.ts'
 
 const OK = (value: unknown): { ok: true; value: unknown } => ({ ok: true, value })
 const FAIL = (error: PanelError): { ok: false; error: PanelError } => ({ ok: false, error })
@@ -22,6 +23,9 @@ const BAD_REQUEST: PanelError = { code: 'internal', message: 'malformed request'
 /** Run-a-file limits: per-stream output cap and hard timeout. */
 const RUN_OUTPUT_CAP = 200_000
 const RUN_TIMEOUT_MS = 60_000
+/** P1-02：运行进程并发上限（防批量拉起子进程耗尽资源）。 */
+const RUN_MAX_CONCURRENT = 3
+let runActiveCount = 0
 
 /** The interpreter for a file extension (node uses the host's own binary). */
 function runCommandFor(path: string): string[] | null {
@@ -40,29 +44,6 @@ const HEARTBEAT_MS = 15_000
 interface Subscriber {
   root: string
   res: ServerResponse
-}
-
-/** Loopback trust fence (same judgment dsh-ssh applies to its host routes). */
-function isLoopbackRequest(request: IncomingMessage): boolean {
-  const address = request.socket.remoteAddress
-  if (address !== '127.0.0.1' && address !== '::1' && address !== '::ffff:127.0.0.1') return false
-  const host = request.headers.host
-  if (typeof host !== 'string') return false
-  let hostUrl: URL
-  try {
-    hostUrl = new URL(`http://${host}`)
-  } catch {
-    return false
-  }
-  if (hostUrl.hostname !== '127.0.0.1' && hostUrl.hostname !== 'localhost' && hostUrl.hostname !== '[::1]') return false
-  if (request.headers['sec-fetch-site'] === 'cross-site') return false
-  const origin = request.headers.origin
-  if (origin === undefined) return true
-  try {
-    return new URL(origin).host === hostUrl.host
-  } catch {
-    return false
-  }
 }
 
 function forbidden(res: ServerResponse): void {
@@ -110,15 +91,34 @@ function isSafeGitPath(value: string): boolean {
   return !value.includes('..') && !value.startsWith('/') && !value.startsWith('\\') && !value.includes(':')
 }
 
-/** Run a git operation against the gated root; errors become PanelError. */
+/**
+ * Run a git operation against the gated root; errors become PanelError.
+ * P0-03: git resolves the repo upward from any subdirectory, so unless
+ * `allowSubdirRoot` is set (status probe), the requested root must itself be
+ * the canonical repository top level. Otherwise the operation is refused —
+ * it could touch files in a parent repo outside the selected root.
+ */
 async function withGitRoot(
   fs: FsService,
   root: string,
   run: (cwd: string) => Promise<unknown>,
+  opts: { allowSubdirRoot?: boolean } = {},
 ): Promise<{ ok: true; value: unknown } | { ok: false; error: PanelError }> {
   const gated = await fs.verify(root)
   if (!gated.ok || gated.canonical === undefined) {
     return { ok: false, error: gated.error ?? { code: 'forbidden', message: 'root not gated' } }
+  }
+  if (!opts.allowSubdirRoot) {
+    const top = await git.repoTopLevel(gated.canonical)
+    if (top !== null && top !== gated.canonical) {
+      return {
+        ok: false,
+        error: {
+          code: 'git-root-outside',
+          message: '所选目录位于父 Git 仓库内，请在 Git 面板中选择该仓库根目录',
+        },
+      }
+    }
   }
   try {
     return { ok: true, value: await run(gated.canonical) }
@@ -272,6 +272,12 @@ export function registerPanelRoutes(ctx: Context, fs: FsService): () => void {
           json(res, FAIL({ code: 'unsupported', message: `不支持运行 .${(path.split('.').pop() ?? '')} 文件（支持 js/ts/py/ps1）` }))
           return
         }
+        // P1-02：并发上限——同时运行太多脚本会耗尽宿主资源。
+        if (runActiveCount >= RUN_MAX_CONCURRENT) {
+          json(res, FAIL({ code: 'run-busy', message: `同时运行的任务已达上限（${RUN_MAX_CONCURRENT} 个），请稍后再试` }))
+          return
+        }
+        runActiveCount += 1
         const start = Date.now()
         let timedOut = false
         let stdout = ''
@@ -309,6 +315,7 @@ export function registerPanelRoutes(ctx: Context, fs: FsService): () => void {
           child.on('close', (code, signal) => done({ code, signal }))
         })
         clearTimeout(timer)
+        runActiveCount = Math.max(0, runActiveCount - 1)
         if (settled.error !== undefined) {
           json(res, FAIL({ code: 'spawn-failed', message: `无法启动解释器: ${settled.error}` }))
           return
@@ -326,7 +333,9 @@ export function registerPanelRoutes(ctx: Context, fs: FsService): () => void {
         return
       }
       case '/dsh-ide/git/status': {
-        const result = await withGitRoot(fs, root, (cwd) => git.status(cwd))
+        // status 是只读探测：root 非仓库（含父仓库子目录）时返回 isRepo:false，
+        // 由前端发现嵌套仓库；写操作（stage/commit 等）仍受 withGitRoot 严格校验。
+        const result = await withGitRoot(fs, root, (cwd) => git.status(cwd), { allowSubdirRoot: true })
         json(res, result.ok ? OK(result.value) : FAIL(result.error))
         return
       }

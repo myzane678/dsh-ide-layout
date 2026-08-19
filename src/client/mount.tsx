@@ -14,23 +14,38 @@ import { ProblemsPanel } from './components/ProblemsPanel.tsx'
 const WORKBENCH_SELECTOR = '[data-ide-workbench]'
 const SIDEBAR_TREE_SELECTOR = '[data-ide-sidebar-tree]'
 
-/** Wait for one selector (the shell/frame mounts after boot settlement). */
+/**
+ * Wait for one selector (the shell/frame mounts after boot settlement), then
+ * keep watching: if the matched host element is later removed (DSH shell
+ * rebuilds its DOM), wait again and re-invoke onFound so the panels remount
+ * (P2-02: survives host DOM replacement instead of mounting once and dying).
+ */
 function waitForElement(selector: string, onFound: (el: HTMLElement) => void): () => void {
   let disposed = false
   let observer: MutationObserver | undefined
+  let currentEl: HTMLElement | null = null
   const tryFind = (): void => {
-    if (disposed) return
+    if (disposed || currentEl !== null) return
     const el = document.querySelector<HTMLElement>(selector)
     if (el !== null) {
-      observer?.disconnect()
+      currentEl = el
       onFound(el)
     }
   }
-  observer = new MutationObserver(() => { tryFind() })
+  observer = new MutationObserver(() => {
+    // 宿主重建：已挂载元素被移除 → 重置等待并重新挂载。
+    if (currentEl !== null && !currentEl.isConnected) {
+      currentEl = null
+      tryFind()
+      return
+    }
+    tryFind()
+  })
   observer.observe(document.body, { childList: true, subtree: true })
   tryFind()
   return () => {
     disposed = true
+    currentEl = null
     observer?.disconnect()
   }
 }
@@ -133,11 +148,35 @@ function Workbench({ api }: { api: IdeMountApi }): JSX.Element {
           tabs={state.tabs}
           activeTabId={state.activeTabId}
           onActivate={(id) => api.ide.update((prev) => ({ ...prev, activeTabId: id }))}
-          onClose={(id) => api.ide.update((prev) => ({
-            ...prev,
-            tabs: prev.tabs.filter((tab) => tab.id !== id),
-            activeTabId: prev.activeTabId === id ? (prev.tabs[prev.tabs.length - 2]?.id ?? null) : prev.activeTabId,
-          }))}
+          onClose={(id) => api.ide.update((prev) => {
+            const closing = prev.tabs.find((tab) => tab.id === id)
+            // P1-05：dirty tab 关闭前确认，防止未保存内容静默丢弃。
+            if (closing?.dirty === true && !window.confirm(`「${closing.title}」有未保存的修改，确定放弃并关闭？`)) {
+              return prev
+            }
+            const index = prev.tabs.findIndex((tab) => tab.id === id)
+            const nextTabs = prev.tabs.filter((tab) => tab.id !== id)
+            // P2-01：先算 nextTabs，再按被关闭 tab 的旧索引选右侧仍存在的 tab，
+            // 否则选左侧；避免指向已移除的 tab（旧逻辑取倒数第二项会再拿到 B）。
+            let nextActive = prev.activeTabId
+            if (prev.activeTabId === id) {
+              nextActive = nextTabs[index]?.id ?? nextTabs[index - 1]?.id ?? null
+            }
+            // P2-05：文件关闭时清理其诊断（按文件路径匹配 file:// URI 后缀）。
+            let diagnostics = prev.diagnostics
+            if (closing !== undefined) {
+              const needle = closing.path.replaceAll('\\', '/')
+              const stale = Object.keys(diagnostics).filter((uri) => {
+                const decoded = decodeURIComponent(uri).replace(/^file:\/\//, '').replace(/^\//, '').replaceAll('\\', '/')
+                return decoded === needle || decoded.endsWith(`/${needle}`)
+              })
+              if (stale.length > 0) {
+                diagnostics = { ...diagnostics }
+                for (const key of stale) delete diagnostics[key]
+              }
+            }
+            return { ...prev, tabs: nextTabs, activeTabId: nextActive, diagnostics }
+          })}
           onContentChange={(id, content) => api.ide.update((prev) => ({
             ...prev,
             tabs: prev.tabs.map((tab) => tab.id === id ? { ...tab, content, dirty: true } : tab),
@@ -146,12 +185,19 @@ function Workbench({ api }: { api: IdeMountApi }): JSX.Element {
             ...prev,
             tabs: prev.tabs.map((item) => item.id === tab.id ? { ...tab, dirty: false } : item),
           }))}
-          onCloseEditor={() => api.ide.update((prev) => ({
-            ...prev,
-            editorVisible: false,
-            tabs: [],
-            activeTabId: null,
-          }))}
+          onCloseEditor={() => api.ide.update((prev) => {
+            // P1-05：整个编辑区含 dirty tab 时先确认。
+            const dirty = prev.tabs.filter((tab) => tab.dirty)
+            if (dirty.length > 0 && !window.confirm(`${dirty.length} 个文件有未保存的修改，确定放弃并关闭编辑区？`)) {
+              return prev
+            }
+            return {
+              ...prev,
+              editorVisible: false,
+              tabs: [],
+              activeTabId: null,
+            }
+          })}
           onAskAgent={api.askAgent}
           onOpenFile={(path, line) => api.openFile(path, line)}
           onDiagnostics={(uri, diagnostics) => api.ide.update((prev) => ({
@@ -174,11 +220,14 @@ export function mountPanels(api: IdeMountApi): () => void {
   const disposers: Array<() => void> = []
 
   disposers.push(waitForElement(SIDEBAR_TREE_SELECTOR, (el) => {
+    // P2-02：宿主重建（旧元素被移除、新元素出现）时先卸载旧 root 再挂载。
+    sidebarRoot?.unmount()
     sidebarRoot = createRoot(el)
     sidebarRoot.render(createElement(SidebarTree, { api }))
   }))
 
   disposers.push(waitForElement(WORKBENCH_SELECTOR, (el) => {
+    workbenchRoot?.unmount()
     workbenchRoot = createRoot(el)
     workbenchRoot.render(createElement(Workbench, { api }))
   }))

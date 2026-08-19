@@ -16,10 +16,13 @@ DSH（DeepSeek Harness）Web GUI 的 IDE 布局插件：左侧工作区文件树
 - 字号缩放：Ctrl/Cmd + 滚轮调整编辑器字号（9–24px，localStorage 记忆，状态栏显示当前字号）
 
 ### LSP（语言服务器协议）
-- TypeScript：`typescript-language-server` 5.3.0
+> 仅对支持的语言启用（P2-04）：语法高亮覆盖 20 种格式，但 LSP 智能能力（补全/诊断/悬停/跳转/重命名等）只面向以下两种语言，其余语言为纯高亮。
+
+- TypeScript / JavaScript：`typescript-language-server` 5.3.0
 - Python：`pyright` 1.1.413
 - 宿主进程为每个 WebSocket 连接启动一个语言服务器子进程（stdio ↔ WS 透传）
 - ⚠️ Electron 宿主必须设置 `ELECTRON_RUN_AS_NODE=1`
+- 终端 / LSP WebSocket 与 HTTP 路由同级校验：仅接受本机 loopback + 同源 Origin 的连接
 
 ### 文件树
 - 左侧栏 flex 流嵌入布局（不覆盖、不遮挡），常驻主视图
@@ -43,6 +46,14 @@ DSH（DeepSeek Harness）Web GUI 的 IDE 布局插件：左侧工作区文件树
 
 ### 运行
 - node / python / pwsh 执行 + 输出面板（60s 超时 + 200KB 上限）
+- 首次运行需确认（localStorage 记忆）；并发上限 3 个进程
+
+### 安全
+- **来源校验**：HTTP / SSE / 终端 WS / LSP WS 统一 loopback + Host + Origin 校验（WebSocket 严格要求同源 Origin，拒绝缺失/跨源/伪造 Host/DNS rebinding）
+- **工作区门控**：所有文件操作经 `realpath()` 校验在工作区内；写/改名/删除前二次 canonical 校验（symlink / reparse point 缓解）
+- **Git 边界**：git 操作要求所选 root 即仓库根，拒绝从子目录上溯操作父仓库；`.git` 路径拒绝写入
+- **资源上限**：LSP 并发 8 连接、单帧 4MB、请求 10s 超时；运行并发 3；终端按 root 隔离
+- **数据保护**：大文件截断后只读禁保存；dirty tab 关闭/切 root 有确认守卫；跨文件编辑带 mtime 冲突检测
 
 ## 架构
 
@@ -58,7 +69,7 @@ src/
 │   ├── xterm-css.ts      # 终端主题
 │   └── components/       # EditorPane / FileTree / GitPanel / ProblemsPanel / TerminalPane
 ├── core/                 # 共享类型
-└── host/                 # 宿主服务：fs-service / git / lsp-service / pty-service / routes / ws-terminal
+└── host/                 # 宿主服务：fs-service / git / lsp-service / pty-service / routes / ws-terminal / security
 ```
 
 - **宿主半区**（exports `.`）：workspace 门控文件系统服务、`/dsh-ide/*` HTTP 路由（JSON 操作 + SSE 变更流）、终端 / LSP WebSocket
@@ -74,11 +85,21 @@ src/
 dsh plugin --profile desktop add "dsh-ide-layout@git+https://github.com/myzane678/dsh-ide-layout.git"
 ```
 
+> **⚠️ 重要**：本插件**不是纯静态前端插件**——它依赖本地宿主能力（workspace 门控文件系统、`/dsh-ide/*` 路由、终端/LSP 子进程、脚本运行）。必须安装在 **desktop profile**（web profile 只有浏览器半区，缺少宿主服务无法工作）。
+
 安装后重启 DSH（或刷新 GUI 页面）生效。之后更新插件只需在 profile 目录执行：
 
 ```bash
 pnpm update dsh-ide-layout
 ```
+
+### 卸载 / 回退
+
+```bash
+dsh plugin --profile desktop remove dsh-ide-layout
+```
+
+回退到上一版本：在 `~/.dsh/profiles/desktop/package.json` 中把依赖改回旧版本号（或 git 提交哈希），然后 `pnpm install` + 重启 DSH。插件只读不写自身之外的状态，卸载不会影响已有文件与仓库。
 
 ### 本地开发构建
 
@@ -88,6 +109,17 @@ pnpm build    # tsc -b && tsdown
 ```
 
 开发监听模式：`pnpm watch`
+
+### 测试
+
+```bash
+pnpm test        # vitest 单测（来源校验 / URI 门禁 / tab 关闭规则）
+pnpm typecheck   # tsc 类型检查
+```
+
+## 更新日志
+
+版本与变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 许可证
 

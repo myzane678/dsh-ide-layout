@@ -19,6 +19,7 @@ import { registerPanelRoutes } from './host/routes.ts'
 import { PtyService } from './host/pty-service.ts'
 import { attachTerminalSocket } from './host/ws-terminal.ts'
 import { attachLspSocket } from './host/lsp-service.ts'
+import { isLoopbackRequest, rejectUpgrade } from './host/security.ts'
 
 /** Required services: the route registry and the workspace registry. */
 export const inject = ['webServer', 'workspaceRegistry']
@@ -83,6 +84,11 @@ export function apply(ctx: Context): void {
     const dispose = ctx.webServer.registerUpgrade({
       path: '/dsh-ide/ws/terminal',
       handler: (req, socket, head) => {
+        // P0-01：WebSocket 与 HTTP 同级来源校验（严格模式：缺失 Origin 直接拒绝）。
+        if (!isLoopbackRequest(req as IncomingMessage, true)) {
+          rejectUpgrade(socket as Duplex)
+          return
+        }
         // `ws` 需要真实的 Node 类型；此处为宿主 webserver 的结构化面（结构兼容）做边界转换。
         wss.handleUpgrade(req as IncomingMessage, socket as Duplex, head as Buffer, (ws) => {
           attachTerminalSocket(fs, pty, req as IncomingMessage, ws)
@@ -102,6 +108,11 @@ export function apply(ctx: Context): void {
     const dispose = ctx.webServer.registerUpgrade({
       path: '/dsh-ide/ws/lsp',
       handler: (req, socket, head) => {
+        // P0-01：与终端 WS 同样的严格来源校验。
+        if (!isLoopbackRequest(req as IncomingMessage, true)) {
+          rejectUpgrade(socket as Duplex)
+          return
+        }
         wss.handleUpgrade(req as IncomingMessage, socket as Duplex, head as Buffer, (ws) => {
           attachLspSocket(fs, req as IncomingMessage, ws)
         })

@@ -32,6 +32,8 @@ export interface EditorTab {
   content: string
   dirty: boolean
   savedMtime?: number
+  /** 文件过大被截断（>500K 字符）：只读，禁止保存（P1-04）。 */
+  truncated?: boolean
 }
 
 export interface IdeState {

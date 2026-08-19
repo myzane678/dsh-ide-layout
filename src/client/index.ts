@@ -45,10 +45,12 @@ export function apply(ctx: ClientContext): void {
     const api: IdeMountApi = {
       ide,
       openFile: (path: string) => {
-        const state = ide.getSnapshot()
-        void openFileInTabs(state.root, path, state.tabs, state.activeTabId, (tabs, active) => {
-          // 点文件树中的文件 → 显示编辑区（按需布局）
-          ide.update((prev) => ({ ...prev, tabs, activeTabId: active, editorVisible: true }))
+        // P1-06：函数式 update，迟到的读取合并进最新 tabs，不覆盖并发打开的文件。
+        void openFileInTabs(ide.getSnapshot().root, path, (updater) => {
+          ide.update((prev) => {
+            const next = updater({ tabs: prev.tabs, activeTabId: prev.activeTabId })
+            return { ...prev, tabs: next.tabs, activeTabId: next.activeTabId, editorVisible: true }
+          })
         })
       },
       // 选中代码 → 追加到当前会话的聊天输入框（draft），由用户确认后发送。
@@ -100,8 +102,14 @@ export function apply(ctx: ClientContext): void {
           root = typeof candidate === 'string' && candidate !== '' ? candidate : ''
         }
         if (root === currentRoot) return
+        // P1-05：切换 session/工作区会清空编辑区，dirty tab 先确认，避免静默丢弃。
+        const dirtyCount = ide.getSnapshot().tabs.filter((tab) => tab.dirty).length
+        if (dirtyCount > 0 && !window.confirm(`切换工作区将关闭编辑区，${dirtyCount} 个文件有未保存的修改，确定继续？`)) {
+          return
+        }
         currentRoot = root
-        ide.update((prev) => ({ ...prev, root, tabs: [], activeTabId: null }))
+        // P2-05：切 root 清空诊断缓存（旧工作区 URI 的诊断不再显示）。
+        ide.update((prev) => ({ ...prev, root, tabs: [], activeTabId: null, diagnostics: {} }))
         disposeEvents?.()
         disposeEvents = undefined
         if (root !== '') {

@@ -1,16 +1,16 @@
 /**
- * PTY service for the IDE terminal: one node-pty shell per workspace root.
- * The shell survives WebSocket disconnects (page refresh) for a grace period
- * and reconnects to the same process; the terminal is a single fixed panel
- * (no tabs), so one live handle is enough. Output is mirrored into a bounded
- * transcript ring so a new connection replays history before live data.
- * Reference: dsh-better-sidebar pty-manager (MIT), trimmed to the IDE scope.
+ * PTY service for the IDE terminal: one node-pty shell per canonical
+ * workspace root (P0-02). Each root gets its own shell, so different
+ * workspaces / windows never share or steal a terminal. A shell survives
+ * WebSocket disconnects (page refresh) for a grace period via connection
+ * reference counting: the kill timer only starts when the LAST connection
+ * to that root drops. Historical output is NOT replayed to new connections
+ * (conservative: a new connection must not read a previous session's
+ * transcript). Reference: dsh-better-sidebar pty-manager (MIT), reworked
+ * for per-root isolation.
  */
 
 import { spawn as ptySpawn, type IPty } from 'node-pty'
-
-/** Per-terminal transcript bound (bytes kept for replay). */
-const TRANSCRIPT_LIMIT = 1 << 20
 
 /** The interactive shell for this platform (Windows short-circuits). */
 function defaultShell(): string {
@@ -20,33 +20,36 @@ function defaultShell(): string {
   return '/bin/bash'
 }
 
-/** One live terminal. */
+/** One live terminal (per canonical root). */
 export interface PtyHandle {
   /** The cwd the process was spawned with (a changed root respawns). */
   cwd: string
   pty: IPty
-  /** Output accumulated since spawn (bounded; head dropped over the limit). */
-  transcript: string
+  /** Active socket connections to this shell (reference count). */
+  connections: number
   exited: boolean
   exitCode?: number | null
 }
 
-/** Single-terminal registry with reconnect grace. */
+/** Per-root terminal registry with reconnect grace. */
 export class PtyService {
-  private session: PtyHandle | null = null
-  private pendingClose: ReturnType<typeof setTimeout> | undefined
+  private readonly sessions = new Map<string, PtyHandle>()
+  private readonly pendingClose = new Map<string, ReturnType<typeof setTimeout>>()
 
   /**
-   * Open (or reuse) the terminal for a root. A handle whose process already
-   * exited — or whose spawn cwd differs from the now-authoritative root — is
-   * replaced with a fresh spawn. Reopening cancels any pending scheduled
-   * close (a reconnect within the grace window keeps the shell alive).
+   * Open (or reuse) the terminal for a root and register one connection.
+   * A handle whose process already exited — or whose spawn cwd differs from
+   * the now-authoritative root — is replaced with a fresh spawn. Reopening
+   * cancels any pending scheduled close for that root.
    */
   open(cwd: string, cols: number, rows: number): PtyHandle {
-    this.cancelClose()
-    const existing = this.session
-    if (existing !== null && !existing.exited && existing.cwd === cwd) return existing
-    if (existing !== null) this.close()
+    this.cancelClose(cwd)
+    const existing = this.sessions.get(cwd)
+    if (existing !== null && existing !== undefined && !existing.exited && existing.cwd === cwd) {
+      existing.connections += 1
+      return existing
+    }
+    if (existing !== undefined) this.close(cwd)
     const args = process.platform === 'win32' ? [] : ['-l']
     const handle: PtyHandle = {
       cwd,
@@ -57,49 +60,51 @@ export class PtyService {
         cwd,
         env: { ...process.env },
       }),
-      transcript: '',
+      connections: 1,
       exited: false,
     }
-    handle.pty.onData((data) => {
-      handle.transcript += data
-      if (handle.transcript.length > TRANSCRIPT_LIMIT) {
-        handle.transcript = handle.transcript.slice(handle.transcript.length - TRANSCRIPT_LIMIT)
-      }
-    })
     handle.pty.onExit(({ exitCode }) => {
       handle.exited = true
       handle.exitCode = exitCode
     })
-    this.session = handle
+    this.sessions.set(cwd, handle)
     return handle
   }
 
-  /** The live handle, or null. */
-  get(): PtyHandle | null {
-    return this.session
+  /** The live handle for a root, or null. */
+  get(cwd: string): PtyHandle | null {
+    return this.sessions.get(cwd) ?? null
   }
 
-  /** Schedule destruction after `delayMs` (bare socket drop grace). */
-  scheduleClose(delayMs: number): void {
-    if (this.session === null) return
-    this.cancelClose()
-    this.pendingClose = setTimeout(() => this.close(), delayMs)
+  /**
+   * Release one connection for a root. The shell is kept alive while any
+   * connection remains; the kill timer starts only when the LAST connection
+   * drops (reconnect grace).
+   */
+  release(cwd: string, delayMs: number): void {
+    const handle = this.sessions.get(cwd)
+    if (handle === undefined) return
+    handle.connections = Math.max(0, handle.connections - 1)
+    if (handle.connections > 0) return
+    this.cancelClose(cwd)
+    this.pendingClose.set(cwd, setTimeout(() => this.close(cwd), delayMs))
   }
 
   /** Cancel a pending scheduled close (the terminal is being reopened). */
-  cancelClose(): void {
-    if (this.pendingClose !== undefined) {
-      clearTimeout(this.pendingClose)
-      this.pendingClose = undefined
+  cancelClose(cwd: string): void {
+    const timer = this.pendingClose.get(cwd)
+    if (timer !== undefined) {
+      clearTimeout(timer)
+      this.pendingClose.delete(cwd)
     }
   }
 
-  /** Kill the shell and drop its state. */
-  close(): void {
-    this.cancelClose()
-    if (this.session === null) return
-    const handle = this.session
-    this.session = null
+  /** Kill the shell for a root and drop its state. */
+  close(cwd: string): void {
+    this.cancelClose(cwd)
+    const handle = this.sessions.get(cwd)
+    if (handle === undefined) return
+    this.sessions.delete(cwd)
     try {
       handle.pty.kill()
     } catch {
@@ -109,6 +114,6 @@ export class PtyService {
 
   /** Close everything (plugin teardown). */
   disposeAll(): void {
-    this.close()
+    for (const cwd of [...this.sessions.keys()]) this.close(cwd)
   }
 }

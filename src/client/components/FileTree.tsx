@@ -267,6 +267,8 @@ export function FileTree({ root, treeTick = 0, onOpenFile }: FileTreeProps): JSX
   const [confirm, setConfirm] = useState<{ path: string; name: string; isDir: boolean } | null>(null)
   const [copied, setCopied] = useState<string | null>(null)
   const lastRoot = useRef('')
+  /** P2-03：root 代际标记——切 root 后旧请求响应直接丢弃，防串树。 */
+  const rootGen = useRef(0)
 
   const storeLevel = useCallback((path: string, level: LevelData): void => {
     dataRef.current = { ...dataRef.current, [path]: level }
@@ -279,10 +281,14 @@ export function FileTree({ root, treeTick = 0, onOpenFile }: FileTreeProps): JSX
     // 非 force（首次展开）显示「加载中」；force（刷新）**保留旧数据**直到新数据到达——
     // 这是文件树不闪的关键：刷新时若清空再异步填充，列表会闪空白
     if (!force) storeLevel(dir, {})
+    const gen = rootGen.current
     void apiList(root, dir).then((result) => {
+      // P2-03：代际校验——切换 root 后旧响应作废。
+      if (gen !== rootGen.current) return
       if (result.ok) storeLevel(dir, { entries: result.value.entries })
       else storeLevel(dir, { error: result.error.message })
     }).catch((cause: unknown) => {
+      if (gen !== rootGen.current) return
       storeLevel(dir, { error: cause instanceof Error ? cause.message : String(cause) })
     })
   }, [root, storeLevel])
@@ -306,6 +312,7 @@ export function FileTree({ root, treeTick = 0, onOpenFile }: FileTreeProps): JSX
     }
     if (lastRoot.current !== root) {
       lastRoot.current = root
+      rootGen.current += 1
       dataRef.current = {}
       setData({})
       expandedRef.current = new Set()

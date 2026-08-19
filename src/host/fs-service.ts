@@ -108,6 +108,29 @@ export type SpawnWatcher = (
 
 const defaultSpawnWatcher: SpawnWatcher = (path, options, listener) => watchPath(path, options, listener)
 
+/**
+ * P1-01（TOCTOU 缓解）：操作前对目标最近已存在祖先做二次 realpath 校验。
+ * 若祖先目录在首次检查后被替换为 symlink/reparse point，二次校验能发现
+ * 它解析到 root 外并拒绝。注意这只能缩小窗口，无法完全消除竞态——
+ * 不声称完全防护（审查要求的边界说明）。
+ */
+async function reverifyAncestors(root: string, abs: string): Promise<PanelError | null> {
+  let probe = abs
+  for (;;) {
+    try {
+      const real = await realpath(probe)
+      if (!isPathInside(root, real)) {
+        return { code: 'path-outside-root', message: 'path resolves outside root (symlink/reparse detected)' }
+      }
+      return null
+    } catch {
+      const parent = dirname(probe)
+      if (parent === probe) return null
+      probe = parent
+    }
+  }
+}
+
 /** Filesystem service: gated listing/read/write plus a change watcher. */
 export class FsService {
   constructor(
@@ -191,6 +214,9 @@ export class FsService {
     if (isGitPath(rel)) return { code: 'path-outside-root', message: 'refusing to touch .git' }
     const resolved = await resolveInsideRoot(gated.canonical, rel)
     if (!resolved.ok) return resolved.error
+    // P1-01：写前二次 canonical 校验（防祖先目录被换为 symlink）。
+    const reverify = await reverifyAncestors(gated.canonical, resolved.abs)
+    if (reverify !== null) return reverify
     try {
       let current: Awaited<ReturnType<typeof stat>>
       try {
@@ -234,6 +260,11 @@ export class FsService {
     if (!source.ok) return source.error
     const target = await resolveInsideRoot(gated.canonical, to)
     if (!target.ok) return target.error
+    // P1-01：改名前后两端二次 canonical 校验。
+    const sourceRecheck = await reverifyAncestors(gated.canonical, source.abs)
+    if (sourceRecheck !== null) return sourceRecheck
+    const targetRecheck = await reverifyAncestors(gated.canonical, target.abs)
+    if (targetRecheck !== null) return targetRecheck
     try {
       await renameFs(source.abs, target.abs)
       return { ok: true }
@@ -250,6 +281,9 @@ export class FsService {
     if (rel === '') return { code: 'path-outside-root', message: 'refusing to remove the workspace root' }
     const resolved = await resolveInsideRoot(gated.canonical, rel)
     if (!resolved.ok) return resolved.error
+    // P1-01：删除前二次 canonical 校验。
+    const reverify = await reverifyAncestors(gated.canonical, resolved.abs)
+    if (reverify !== null) return reverify
     try {
       await rm(resolved.abs, { recursive: true, force: false })
       return { ok: true }

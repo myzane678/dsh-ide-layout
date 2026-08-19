@@ -36,6 +36,11 @@ export function lspServerForPath(path: string): string | null {
   return language === 'python' ? 'py' : 'ts'
 }
 
+/** P1-03：LSP 子进程并发上限 + 单帧大小上限（防资源耗尽）。 */
+const LSP_MAX_CONNECTIONS = 8
+const LSP_MAX_FRAME_BYTES = 4 * 1024 * 1024
+let lspActiveCount = 0
+
 /** Accumulate stdin chunks and split on Content-Length framing. */
 class FrameReader {
   private buffer = Buffer.alloc(0)
@@ -104,6 +109,12 @@ export function attachLspSocket(fs: FsService, req: IncomingMessage, ws: WebSock
         ws.close(1011, gated.error?.message ?? 'root not gated')
         return
       }
+      // P1-03：连接数上限——异常/恶意客户端不能批量拉起 LSP 子进程。
+      if (lspActiveCount >= LSP_MAX_CONNECTIONS) {
+        ws.close(1013, `too many LSP connections (${LSP_MAX_CONNECTIONS})`)
+        return
+      }
+      lspActiveCount += 1
       const bridge: Bridge = {
         child: spawn(process.execPath, [entry, '--stdio'], {
           cwd: gated.canonical,
@@ -141,13 +152,47 @@ export function attachLspSocket(fs: FsService, req: IncomingMessage, ws: WebSock
           if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(message))
         })
       })
+      // P1-03：URI 门禁——LSP 请求中的文件 URI 必须位于授权工作区内，
+      // 防止语言服务器读取/索引工作区外的文件（Windows 大小写不敏感）。
+      // 路径 → file:// URI：保留盘符冒号（E:/work → e:/work），小写化便于比较。
+      const rootUriPrefix = 'file:///' + gated.canonical
+        .replaceAll('\\', '/')
+        .replace(/^([a-zA-Z]):/, (_m, drive: string) => `${drive.toLowerCase()}:`)
+        .replace(/\/+$/, '')
+      const uriAllowed = (uri: unknown): boolean => {
+        if (typeof uri !== 'string') return true
+        const norm = decodeURIComponent(uri).toLowerCase()
+        return norm.startsWith(rootUriPrefix.toLowerCase())
+      }
       ws.on('message', (data) => {
         if (bridge.exited || bridge.child.stdin === null) return
-        const body = Buffer.from(data.toString('utf8'), 'utf8')
-        bridge.child.stdin.write(`Content-Length: ${body.length}\r\n\r\n`)
-        bridge.child.stdin.write(body)
+        // P1-03：单帧大小上限（data 可能是 Buffer / ArrayBuffer / Buffer[]）。
+        const frame = Buffer.isBuffer(data) ? data : Buffer.from(String(data), 'utf8')
+        if (frame.length > LSP_MAX_FRAME_BYTES) {
+          ws.close(1009, 'message too large')
+          return
+        }
+        // P1-03：校验消息内引用的文件 URI（textDocument.uri / uri）。
+        try {
+          const message = JSON.parse(frame.toString('utf8')) as {
+            params?: { textDocument?: { uri?: unknown }; uri?: unknown }
+          }
+          const params = message.params
+          if (params !== undefined && typeof params === 'object') {
+            const candidate = params.textDocument?.uri ?? params.uri
+            if (candidate !== undefined && !uriAllowed(candidate)) {
+              ws.close(1008, 'uri outside workspace')
+              return
+            }
+          }
+        } catch {
+          // 非 JSON（keep-alive 等）放行；JSON 解析失败由下游处理。
+        }
+        bridge.child.stdin.write(`Content-Length: ${frame.length}\r\n\r\n`)
+        bridge.child.stdin.write(frame)
       })
       ws.on('close', () => {
+        lspActiveCount = Math.max(0, lspActiveCount - 1)
         if (!bridge.exited) {
           try {
             bridge.child.kill()

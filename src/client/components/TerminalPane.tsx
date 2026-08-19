@@ -1,6 +1,6 @@
 /** Bottom terminal: xterm.js over a WebSocket to the host pty.
  *  Wire protocol: input = raw text, resize = JSON {type:'resize',cols,rows}.
- *  The host replays the transcript on connect, then streams live output.
+ *  The host streams live output only (no transcript replay, P0-02).
  *  Transient disconnects (page refresh, panel toggle) reconnect to the SAME
  *  shell within the host's grace window; a server-side refusal (close code
  *  1011 with a reason) stops the loop and shows the reason with a manual
