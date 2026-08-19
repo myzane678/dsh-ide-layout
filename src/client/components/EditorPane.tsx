@@ -128,6 +128,10 @@ interface CodeMirrorPaneProps {
   root: string
   /** 光标位置变化回调（状态栏行列显示）。 */
   onCursor?: (line: number, column: number) => void
+  /** 编辑器字号（px，Ctrl/Cmd+滚轮调整）。 */
+  fontSize: number
+  /** 字号变化回调（Ctrl/Cmd+滚轮），父层持久化并显示。 */
+  onFontSizeChange: (size: number) => void
 }
 
 /** LSP 0-based {line, character} → CodeMirror 文档 offset。 */
@@ -411,7 +415,7 @@ async function codeActionsFor(
 /** One CodeMirror instance per tab. The parent remounts this component via
  * `key={tab.id}` on tab switch; the view is created once on mount and
  * destroyed on unmount (non-controlled: doc flows out via updateListener). */
-function CodeMirrorPane({ tab, onContentChange, onSave, onContextAction, lsp, diagnostics, onOpenLocation, revealLine, onRevealDone, root, onCursor }: CodeMirrorPaneProps): JSX.Element {
+function CodeMirrorPane({ tab, onContentChange, onSave, onContextAction, lsp, diagnostics, onOpenLocation, revealLine, onRevealDone, root, onCursor, fontSize, onFontSizeChange }: CodeMirrorPaneProps): JSX.Element {
   const hostRef = useRef<HTMLDivElement | null>(null)
   const viewRef = useRef<EditorView | null>(null)
   // 右键菜单：无选中时也弹出（重命名/格式化/快速修复）；text 为空表示无选中。
@@ -421,8 +425,22 @@ function CodeMirrorPane({ tab, onContentChange, onSave, onContextAction, lsp, di
   // 重命名输入框
   const [renameBox, setRenameBox] = useState<{ x: number; y: number; initial: string } | null>(null)
   // Latest props for the mount-time closures (keymap / updateListener / LSP).
-  const propsRef = useRef({ tab, onContentChange, onSave, lsp, diagnostics, onOpenLocation, revealLine, onRevealDone, root, onCursor })
-  propsRef.current = { tab, onContentChange, onSave, lsp, diagnostics, onOpenLocation, revealLine, onRevealDone, root, onCursor }
+  const propsRef = useRef({ tab, onContentChange, onSave, lsp, diagnostics, onOpenLocation, revealLine, onRevealDone, root, onCursor, fontSize, onFontSizeChange })
+  propsRef.current = { tab, onContentChange, onSave, lsp, diagnostics, onOpenLocation, revealLine, onRevealDone, root, onCursor, fontSize, onFontSizeChange }
+
+  // Ctrl/Cmd + 滚轮调整编辑器字号（VS Code 习惯）。
+  useEffect(() => {
+    const host = hostRef.current
+    if (host === null) return
+    const onWheel = (event: WheelEvent): void => {
+      if (!(event.ctrlKey || event.metaKey)) return
+      event.preventDefault()
+      const next = Math.min(24, Math.max(9, propsRef.current.fontSize + (event.deltaY < 0 ? 1 : -1)))
+      propsRef.current.onFontSizeChange(next)
+    }
+    host.addEventListener('wheel', onWheel, { passive: false })
+    return () => host.removeEventListener('wheel', onWheel)
+  }, [])
 
   useEffect(() => {
     // LSP 扩展是否安装只看文件类型（语言是否支持），不依赖 lsp 是否已就绪——
@@ -440,7 +458,7 @@ function CodeMirrorPane({ tab, onContentChange, onSave, onContextAction, lsp, di
         EditorView.lineWrapping,
         EditorView.theme({
           '&': {
-            height: '100%', fontSize: '13px',
+            height: '100%', fontSize: 'var(--ide-editor-font-size, 13px)',
             backgroundColor: 'var(--dsw-alias-bg-base, #ffffff)',
             color: 'inherit',
           },
@@ -624,7 +642,7 @@ function CodeMirrorPane({ tab, onContentChange, onSave, onContextAction, lsp, di
     <>
       <div
         ref={hostRef}
-        style={{ flex: 1, minHeight: 0, overflow: 'hidden' }}
+        style={{ flex: 1, minHeight: 0, overflow: 'hidden', ['--ide-editor-font-size' as string]: `${fontSize}px` }}
         onContextMenu={(event) => {
           const view = viewRef.current
           if (view === null) return
@@ -924,6 +942,15 @@ export function EditorPane({
   const [lspStatus, setLspStatus] = useState('')
   // 状态栏：光标行列
   const [cursorPos, setCursorPos] = useState<{ line: number; column: number } | null>(null)
+  // 编辑器字号（px）：Ctrl/Cmd+滚轮调整，localStorage 记忆（VS Code 习惯）。
+  const [editorFontSize, setEditorFontSize] = useState(() => {
+    const saved = Number.parseInt(localStorage.getItem('dsh-ide-editor-font-size') ?? '', 10)
+    return Number.isFinite(saved) && saved >= 9 && saved <= 24 ? saved : 13
+  })
+  const changeFontSize = (size: number): void => {
+    setEditorFontSize(size)
+    localStorage.setItem('dsh-ide-editor-font-size', String(size))
+  }
 
   // 当前文件的 LSP 客户端：python → py，其余 → ts。
   const lspFor = (path: string): LspClient | null => {
@@ -1139,6 +1166,8 @@ export function EditorPane({
             onRevealDone={() => setRevealTarget(null)}
             root={root}
             onCursor={(line, column) => setCursorPos({ line, column })}
+            fontSize={editorFontSize}
+            onFontSizeChange={changeFontSize}
             onContextAction={(kind, text) => {
               if (kind === 'copy') {
                 void writeClipboard(text)
@@ -1242,6 +1271,7 @@ export function EditorPane({
           {activeTab !== null && (
             <>
               <span title="光标位置">{cursorPos !== null ? `行 ${cursorPos.line}, 列 ${cursorPos.column}` : ''}</span>
+              <span title={`编辑器字号（Ctrl+滚轮调整）: ${editorFontSize}px`}>{editorFontSize}px</span>
               <span title="语言">{languageIdForPath(activeTab.path) ?? 'plaintext'}</span>
               {(() => {
                 const list = diagMap.get(normalizeUri(pathToUri(root, activeTab.path))) ?? []

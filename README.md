@@ -13,6 +13,7 @@ DSH（DeepSeek Harness）Web GUI 的 IDE 布局插件：左侧工作区文件树
 - F12 / Ctrl+点击 跳转定义、F2 重命名、Shift+Alt+F 格式化
 - 右键快速修复、Tab 接受补全
 - 保存：Ctrl+S 快捷键 + tab 栏「💾 保存」按钮（有未保存更改时可用，状态栏反馈）
+- 字号缩放：Ctrl/Cmd + 滚轮调整编辑器字号（9–24px，localStorage 记忆，状态栏显示当前字号）
 
 ### LSP（语言服务器协议）
 - TypeScript：`typescript-language-server` 5.3.0
