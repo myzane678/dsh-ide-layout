@@ -30,6 +30,9 @@ import { sass } from '@codemirror/lang-sass'
 import { less } from '@codemirror/lang-less'
 import { StreamLanguage } from '@codemirror/language'
 import { toml } from '@codemirror/legacy-modes/mode/toml'
+import { powerShell } from '@codemirror/legacy-modes/mode/powershell'
+import { shell } from '@codemirror/legacy-modes/mode/shell'
+import { batchLanguage } from '../batch-mode.ts'
 import { apiRead, apiRun, apiWrite } from '../api.ts'
 import type { RunResult } from '../api.ts'
 import type { EditorTab } from '../store.ts'
@@ -82,6 +85,9 @@ function languageFor(path: string): Extension {
     case 'scss': return sass()
     case 'less': return less()
     case 'toml': return StreamLanguage.define(toml)
+    case 'cmd': case 'bat': return batchLanguage
+    case 'ps1': case 'psm1': case 'psd1': return StreamLanguage.define(powerShell)
+    case 'sh': case 'bash': case 'zsh': return StreamLanguage.define(shell)
     default: return []
   }
 }

@@ -7,7 +7,7 @@ DSH（DeepSeek Harness）Web GUI 的 IDE 布局插件：左侧工作区文件树
 ## 功能特性
 
 ### 编辑器（CodeMirror 6）
-- 语法高亮：JavaScript / TypeScript / JSX / JSON / Markdown / Python / HTML / CSS / YAML / XML / SQL / Java / C/C++ / Rust / Go / PHP / Vue / SCSS / LESS / TOML
+- 语法高亮：JavaScript / TypeScript / JSX / JSON / Markdown / Python / HTML / CSS / YAML / XML / SQL / Java / C/C++ / Rust / Go / PHP / Vue / SCSS / LESS / TOML / Batch（.cmd/.bat）/ PowerShell / Shell
 - 行号、代码折叠、状态栏（语言 / 行列 / 诊断数）
 - 自动补全（LSP）、诊断波浪线、悬停提示
 - F12 / Ctrl+点击 跳转定义、F2 重命名、Shift+Alt+F 格式化
@@ -16,7 +16,7 @@ DSH（DeepSeek Harness）Web GUI 的 IDE 布局插件：左侧工作区文件树
 - 字号缩放：Ctrl/Cmd + 滚轮调整编辑器字号（9–24px，localStorage 记忆，状态栏显示当前字号）
 
 ### LSP（语言服务器协议）
-> 仅对支持的语言启用（P2-04）：语法高亮覆盖 20 种格式，但 LSP 智能能力（补全/诊断/悬停/跳转/重命名等）只面向以下两种语言，其余语言为纯高亮。
+> 仅对支持的语言启用（P2-04）：语法高亮覆盖 23 种格式，但 LSP 智能能力（补全/诊断/悬停/跳转/重命名等）只面向以下两种语言，其余语言为纯高亮。
 
 - TypeScript / JavaScript：`typescript-language-server` 5.3.0
 - Python：`pyright` 1.1.413
