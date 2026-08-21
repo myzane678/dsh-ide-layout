@@ -1,7 +1,7 @@
 {
   "name": "dsh-ide-layout",
   "description": "DSH web GUI IDE layout: left file tree (dirs + files), center editor + terminal, right agent chat. Self-built per user request, dsh-web-ui/aionui-panel as reference.",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "packageManager": "pnpm@11.7.0",
   "type": "module",
   "main": "lib/index.js",

@@ -379,7 +379,7 @@ export function TerminalPane({ root, fitTick = 0 }: { root: string; fitTick?: nu
           style={{
             position: 'fixed', left: Math.max(4, Math.min(termMenu.x, window.innerWidth - 180)),
             top: Math.max(4, Math.min(termMenu.y, window.innerHeight - 160)),
-            zIndex: 1100, minWidth: 160, padding: '4px 0',
+            zIndex: 2147483000, minWidth: 160, padding: '4px 0',
             // 浮层用 overlay + label-primary 自足背景（皮肤透明化 bg-base 时仍可读）。
             background: 'var(--dsw-alias-bg-overlay, rgba(248,250,255,0.98))',
             color: 'var(--dsw-alias-label-primary, #1a1a1a)',

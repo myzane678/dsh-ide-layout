@@ -485,7 +485,7 @@ export function FileTree({ root, treeTick = 0, onOpenFile }: FileTreeProps): JSX
             position: 'fixed',
             left: menuLeft,
             top: menuTop,
-            zIndex: 1000,
+            zIndex: 2147483000,
             minWidth: 190,
             padding: '4px 0',
             background: 'var(--dsw-alias-bg-overlay, rgba(248,250,255,0.96))',
@@ -535,7 +535,7 @@ export function FileTree({ root, treeTick = 0, onOpenFile }: FileTreeProps): JSX
           style={{
             position: 'fixed',
             inset: 0,
-            zIndex: 1100,
+            zIndex: 2147483000,
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',

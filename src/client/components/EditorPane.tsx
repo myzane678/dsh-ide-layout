@@ -194,7 +194,7 @@ function showBlameTooltip(anchor: HTMLElement, info: BlameLine): void {
   hideBlameTooltip()
   const el = blameTooltipDom(info)
   el.style.position = 'fixed'
-  el.style.zIndex = '2000'
+  el.style.zIndex = '2147483000'
   document.body.appendChild(el)
   blameTooltipEl = el
   const rect = anchor.getBoundingClientRect()
@@ -1112,7 +1112,7 @@ function CodeMirrorPane({ tab, onContentChange, onSave, onContextAction, lsp, di
           style={{
             position: 'fixed', left: Math.max(4, Math.min(menu.x, window.innerWidth - 220)),
             top: Math.max(4, Math.min(menu.y, window.innerHeight - 120)),
-            zIndex: 1000, minWidth: 200, padding: '4px 0',
+            zIndex: 2147483000, minWidth: 200, padding: '4px 0',
             // 皮肤把 --dsw-alias-bg-base 全局透明化，浮层用 overlay（近不透明层变量）
             // + label-primary（文字色）自足背景，避免透明菜单透出底下内容看不清。
             background: 'var(--dsw-alias-bg-overlay, rgba(248,250,255,0.96))',
@@ -1184,7 +1184,7 @@ function CodeMirrorPane({ tab, onContentChange, onSave, onContextAction, lsp, di
           style={{
             position: 'fixed', left: Math.max(4, Math.min(actions.x, window.innerWidth - 260)),
             top: Math.max(4, Math.min(actions.y, window.innerHeight - 160)),
-            zIndex: 1001, minWidth: 240, padding: '4px 0',
+            zIndex: 2147483000, minWidth: 240, padding: '4px 0',
             background: 'var(--dsw-alias-bg-overlay, rgba(248,250,255,0.98))',
             color: 'var(--dsw-alias-label-primary, #1a1a1a)',
             border: '1px solid var(--ide-border,#e5e6eb)', borderRadius: 6,
@@ -1211,7 +1211,7 @@ function CodeMirrorPane({ tab, onContentChange, onSave, onContextAction, lsp, di
           style={{
             position: 'fixed', left: Math.max(4, Math.min(renameBox.x, window.innerWidth - 260)),
             top: Math.max(4, Math.min(renameBox.y, window.innerHeight - 80)),
-            zIndex: 1001, width: 240, padding: '6px 10px',
+            zIndex: 2147483000, width: 240, padding: '6px 10px',
             background: 'var(--dsw-alias-bg-overlay, rgba(248,250,255,0.98))',
             color: 'var(--dsw-alias-label-primary, #1a1a1a)',
             border: '1px solid var(--ide-accent,#4f8cff)', borderRadius: 6,
@@ -1389,8 +1389,9 @@ export function EditorPane({
   const [lspFullError, setLspFullError] = useState<Record<string, string>>({})
   // 状态栏：光标行列
   const [cursorPos, setCursorPos] = useState<{ line: number; column: number } | null>(null)
-  // 编码选择菜单（状态栏点击编码弹出；坐标为触发元素位置，portal 定位于其上方）。
-  const [encMenu, setEncMenu] = useState<{ x: number; y: number } | null>(null)
+  // 编码选择菜单（状态栏点击编码弹出；up=true 时贴按钮上沿向上生长，
+  // 按钮上方空间不足时才向下弹，避免被下方编辑区/面板遮挡）。
+  const [encMenu, setEncMenu] = useState<{ x: number; up: boolean; rectTop: number } | null>(null)
   // 编辑器字号（px）：Ctrl/Cmd+滚轮调整，localStorage 记忆（VS Code 习惯）。
   const [editorFontSize, setEditorFontSize] = useState(() => {
     const saved = Number.parseInt(localStorage.getItem('dsh-ide-editor-font-size') ?? '', 10)
@@ -1909,7 +1910,9 @@ export function EditorPane({
                 title="文件编码，点击选择（以新编码重新加载）"
                 onClick={(event) => {
                   const rect = (event.currentTarget as HTMLElement).getBoundingClientRect()
-                  setEncMenu({ x: rect.left, y: rect.top - 4 })
+                  // 菜单高度约 280px：按钮上方空间足够 → 向上生长（贴按钮上沿）；
+                  // 否则向下弹，防止被窗口顶边截断。
+                  setEncMenu({ x: rect.left, up: rect.top > 300, rectTop: rect.top })
                 }}
                 style={{ cursor: 'pointer', borderBottom: '1px dotted var(--ide-muted,#9ca3af)' }}
               >
@@ -1932,15 +1935,18 @@ export function EditorPane({
           <span>{status !== '' ? status : (activeTab !== null ? (activeTab.kind === 'image' ? '图片' : activeTab.dirty ? '未保存' : '已保存') : '')}</span>
         </span>
       </div>
-      {/* 编码选择菜单（状态栏点击编码弹出，选择后以新编码重新加载当前文件） */}
+      {/* 编码选择菜单（状态栏点击编码弹出，选择后以新编码重新加载当前文件）。
+          默认贴按钮上沿向上生长（bottom 定位）；按钮贴近窗口顶部时向下弹。 */}
       {encMenu !== null && createPortal(
         <div
           data-ide-editor-menu=""
           style={{
             position: 'fixed',
             left: Math.max(4, Math.min(encMenu.x, window.innerWidth - 240)),
-            top: Math.max(4, encMenu.y),
-            zIndex: 1000, minWidth: 230, maxHeight: 280, overflow: 'auto', padding: '4px 0',
+            ...(encMenu.up
+              ? { bottom: window.innerHeight - encMenu.rectTop + 4 }
+              : { top: encMenu.rectTop + 20 }),
+            zIndex: 2147483000, minWidth: 230, maxHeight: 280, overflow: 'auto', padding: '4px 0',
             background: 'var(--dsw-alias-bg-overlay, rgba(248,250,255,0.98))',
             color: 'var(--dsw-alias-label-primary, #1a1a1a)',
             border: '1px solid var(--ide-border,#e5e6eb)', borderRadius: 6,
