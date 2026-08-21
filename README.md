@@ -11,17 +11,21 @@ DSH（DeepSeek Harness）Web GUI 的 IDE 布局插件：左侧工作区文件树
 - 行号、代码折叠、状态栏（语言 / 行列 / 诊断数）
 - 自动补全（LSP）、诊断波浪线、悬停提示
 - F12 / Ctrl+点击 跳转定义、F2 重命名、Shift+Alt+F 格式化
-- 右键快速修复、Tab 接受补全
+- 右键快速修复、Tab 接受补全；**Tab / Shift+Tab 缩进与反缩进**（无补全/snippet 时，多行选中整块缩进）
+- **Enter 自动缩进 4 空格**（CodeMirror 默认 2 空格已改为 VS Code 习惯的 4 空格，语言包未自设缩进单位的语言统一生效）
+- **编码选择**：状态栏显示当前文件编码，点击弹出菜单（UTF-8 / 自动检测 / GB18030 / GBK / Big5 / UTF-16 LE / ISO-8859-1）；切换后以新编码重新加载，保存按所选编码写回（GBK 等中文旧文件不乱码）；「自动检测」先严格 UTF-8、失败按 GB18030 解码
+- **图片预览**：双击 png/jpg/jpeg/gif/webp/bmp/ico/avif 在编辑区显示图片（滚轮缩放、双击适合窗口、底部工具栏），只读不可保存/运行
 - 保存：Ctrl+S 快捷键 + tab 栏「💾 保存」按钮（有未保存更改时可用，状态栏反馈）
 - 字号缩放：Ctrl/Cmd + 滚轮调整编辑器字号（9–24px，localStorage 记忆，状态栏显示当前字号）
 - **GitLens 式行内 blame**：工具栏「○ Blame」开关（默认关，localStorage 记忆）→ 编辑器左侧 gutter 逐行标注「短 hash + 作者」，悬停浮层显示完整提交信息；状态栏光标行始终显示「◉ 作者 · 相对时间 · 短 hash」；工作区根非 Git 仓库时自动定位嵌套子仓库；未启用/编辑中整列不渲染
 
 ### LSP（语言服务器协议）
-> 仅对支持的语言启用（P2-04）：语法高亮覆盖 23 种格式，但 LSP 智能能力（补全/诊断/悬停/跳转/重命名等）只面向以下三种语言，其余语言为纯高亮。
+> 仅对支持的语言启用（P2-04）：语法高亮覆盖 23 种格式，LSP 智能能力（补全/诊断/悬停/跳转/重命名等）面向 TS/Python/PowerShell，以及检测到 JDTLS 时的 Java。
 
 - TypeScript / JavaScript：`typescript-language-server` 5.3.0
 - Python：`pyright` 1.1.413
 - PowerShell：**PowerShell Editor Services 4.7.0 + PSScriptAnalyzer**（`.ps1`/`.psm1`/`.psd1`；捆绑模块位于插件 `vendor/`，从 GitHub releases / PSGallery 手动更新，不入 git 仓库）
+- Java：**Eclipse JDT Language Server**（复用本机 Red Hat VS Code Java 扩展的 JDTLS；也可用 `DSH_JAVA_LS_HOME` 指定 JDTLS 根目录；需要 JDK 21+；未找到时自动降级为纯 Java 高亮）
 - 宿主进程为每个 WebSocket 连接启动一个语言服务器子进程（stdio ↔ WS 透传）
 - ⚠️ Electron 宿主必须设置 `ELECTRON_RUN_AS_NODE=1`
 - 终端 / LSP WebSocket 与 HTTP 路由同级校验：仅接受本机 loopback + 同源 Origin 的连接
@@ -49,6 +53,7 @@ DSH（DeepSeek Harness）Web GUI 的 IDE 布局插件：左侧工作区文件树
 
 ### 运行
 - node / python / pwsh 执行 + 输出面板（60s 超时 + 200KB 上限）
+- Java 单文件运行：`javac` 编译到系统临时目录后用 `java` 执行，支持无依赖单文件和 `package` 声明；Maven/Gradle 项目请使用终端
 - 首次运行需确认（localStorage 记忆）；并发上限 3 个进程
 
 ### 安全

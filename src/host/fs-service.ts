@@ -10,7 +10,10 @@
 import { mkdir, readdir, readFile, realpath, rename as renameFs, rm, stat, writeFile } from 'node:fs/promises'
 import { watch as watchPath, type Dirent, type FSWatcher } from 'node:fs'
 import { join, dirname } from 'node:path'
-import type { DirListing, FileRead, FsEntry, PanelError } from '../core/types.ts'
+import type { DirListing, FileRead, FileReadBinary, FsEntry, PanelError } from '../core/types.ts'
+import { isTextEncodingId, type TextEncodingId } from '../core/encoding.ts'
+import { imageMimeForPath, IMAGE_CAP_BYTES } from '../core/media.ts'
+import { decodeText, encodeText } from './encoding.ts'
 
 /** Text read ceiling for the editor. */
 const TEXT_CAP_CHARS = 500_000
@@ -177,8 +180,14 @@ export class FsService {
     return { root: gated.canonical, entries: out }
   }
 
-  /** Read one file as utf-8 text (capped). */
-  async read(root: string, rel: string): Promise<FileRead | PanelError> {
+  /**
+   * Read one file as text (capped), decoding with the requested encoding.
+   * `encoding` may be 'auto'（先检测再解码，返回实际使用的编码）或白名单编码。
+   */
+  async read(root: string, rel: string, encoding: TextEncodingId | 'auto' = 'utf-8'): Promise<FileRead | PanelError> {
+    if (encoding !== 'auto' && !isTextEncodingId(encoding)) {
+      return { code: 'encoding-unsupported', message: `不支持的编码: ${encoding}` }
+    }
     const gated = await this.gate(root)
     if (!gated.ok || gated.canonical === undefined) return gated.error ?? { code: 'forbidden', message: 'root not gated' }
     const resolved = await resolveInsideRoot(gated.canonical, rel)
@@ -192,14 +201,40 @@ export class FsService {
       return { code: 'not-found', message: `cannot read ${rel}` }
     }
     if (info.isDirectory()) return { code: 'is-directory', message: `${rel} is a directory` }
-    const text = data.toString('utf8')
+    const { text, encoding: used } = decodeText(data, encoding)
     const truncated = text.length > TEXT_CAP_CHARS
     return {
       content: truncated ? text.slice(0, TEXT_CAP_CHARS) : text,
       truncated,
       size: data.length,
       mtime: info.mtimeMs,
+      encoding: used,
     }
+  }
+
+  /** Read an image file as base64 + MIME（编辑器图片预览；扩展名白名单限定）。 */
+  async readBinary(root: string, rel: string): Promise<FileReadBinary | PanelError> {
+    const mime = imageMimeForPath(rel)
+    if (mime === null) {
+      return { code: 'unsupported-media', message: `不是可预览的图片类型: ${rel}` }
+    }
+    const gated = await this.gate(root)
+    if (!gated.ok || gated.canonical === undefined) return gated.error ?? { code: 'forbidden', message: 'root not gated' }
+    const resolved = await resolveInsideRoot(gated.canonical, rel)
+    if (!resolved.ok) return resolved.error
+    let data: Buffer
+    let info: Awaited<ReturnType<typeof stat>>
+    try {
+      data = await readFile(resolved.abs)
+      info = await stat(resolved.abs)
+    } catch {
+      return { code: 'not-found', message: `cannot read ${rel}` }
+    }
+    if (info.isDirectory()) return { code: 'is-directory', message: `${rel} is a directory` }
+    if (data.length > IMAGE_CAP_BYTES) {
+      return { code: 'file-too-large', message: `图片超过 ${Math.round(IMAGE_CAP_BYTES / 1024 / 1024)}MB，无法预览` }
+    }
+    return { data: data.toString('base64'), mime, size: data.length, mtime: info.mtimeMs }
   }
 
   /** Write text content back, refusing when the file moved on disk. */
@@ -208,7 +243,11 @@ export class FsService {
     rel: string,
     content: string,
     baseMtime?: number,
+    encoding: TextEncodingId = 'utf-8',
   ): Promise<{ mtime: number } | PanelError> {
+    if (!isTextEncodingId(encoding)) {
+      return { code: 'encoding-unsupported', message: `不支持的编码: ${encoding}` }
+    }
     const gated = await this.gate(root)
     if (!gated.ok || gated.canonical === undefined) return gated.error ?? { code: 'forbidden', message: 'root not gated' }
     if (isGitPath(rel)) return { code: 'path-outside-root', message: 'refusing to touch .git' }
@@ -228,7 +267,7 @@ export class FsService {
         return { code: 'write-conflict', message: 'file changed on disk since it was loaded' }
       }
       await mkdir(dirname(resolved.abs), { recursive: true })
-      await writeFile(resolved.abs, content, 'utf8')
+      await writeFile(resolved.abs, encodeText(content, encoding))
       const info = await stat(resolved.abs)
       return { mtime: info.mtimeMs }
     } catch {

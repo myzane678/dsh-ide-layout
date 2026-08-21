@@ -1,6 +1,6 @@
 /** Browser-side fetch wrapper for the /dsh-ide host routes. */
 
-import type { DirListing, FileRead, PanelError } from '../core/types.ts'
+import type { DirListing, FileRead, FileReadBinary, PanelError } from '../core/types.ts'
 
 export type Envelope<T> =
   | { ok: true; value: T }
@@ -29,12 +29,18 @@ export function apiList(root: string, path: string): Promise<Envelope<DirListing
   return post<DirListing>('/dsh-ide/list', { root, path })
 }
 
-export function apiRead(root: string, path: string): Promise<Envelope<FileRead>> {
-  return post<FileRead>('/dsh-ide/read', { root, path })
+/** 按编码读取文本；encoding 缺省为 utf-8，'auto' 为自动检测。 */
+export function apiRead(root: string, path: string, encoding?: string): Promise<Envelope<FileRead>> {
+  return post<FileRead>('/dsh-ide/read', { root, path, encoding })
 }
 
-export function apiWrite(root: string, path: string, content: string, baseMtime?: number): Promise<Envelope<{ mtime: number }>> {
-  return post<{ mtime: number }>('/dsh-ide/write', { root, path, content, baseMtime })
+/** 读取图片为 base64（编辑器图片预览）。 */
+export function apiReadBinary(root: string, path: string): Promise<Envelope<FileReadBinary>> {
+  return post<FileReadBinary>('/dsh-ide/read-binary', { root, path })
+}
+
+export function apiWrite(root: string, path: string, content: string, baseMtime?: number, encoding?: string): Promise<Envelope<{ mtime: number }>> {
+  return post<{ mtime: number }>('/dsh-ide/write', { root, path, content, baseMtime, encoding })
 }
 
 export function apiCreateDir(root: string, path: string): Promise<Envelope<{ ok: true }>> {

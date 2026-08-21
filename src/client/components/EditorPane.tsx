@@ -5,12 +5,13 @@
 import { useEffect, useRef, useState, type JSX } from 'react'
 import { createPortal } from 'react-dom'
 import { basicSetup } from 'codemirror'
-import { EditorView, GutterMarker, gutter, hoverTooltip, keymap, type Tooltip } from '@codemirror/view'
-import { Compartment, Prec, EditorState, type Extension, type Text } from '@codemirror/state'
-import { HighlightStyle, syntaxHighlighting } from '@codemirror/language'
+import { EditorView, GutterMarker, gutter, hoverTooltip, keymap, showTooltip, tooltips, type Tooltip } from '@codemirror/view'
+import { Compartment, Prec, EditorState, StateEffect, StateField, type Extension, type Text } from '@codemirror/state'
+import { HighlightStyle, indentUnit, syntaxHighlighting } from '@codemirror/language'
 import { tags as t } from '@lezer/highlight'
-import { autocompletion, acceptCompletion, type CompletionContext, type CompletionResult } from '@codemirror/autocomplete'
+import { autocompletion, acceptCompletion, hasNextSnippetField, hasPrevSnippetField, nextSnippetField, prevSnippetField, snippet, startCompletion, type CompletionContext, type CompletionResult } from '@codemirror/autocomplete'
 import { forceLinting, linter, type Diagnostic } from '@codemirror/lint'
+import { indentLess, indentMore } from '@codemirror/commands'
 import { javascript } from '@codemirror/lang-javascript'
 import { json } from '@codemirror/lang-json'
 import { markdown } from '@codemirror/lang-markdown'
@@ -33,13 +34,15 @@ import { toml } from '@codemirror/legacy-modes/mode/toml'
 import { powerShell } from '@codemirror/legacy-modes/mode/powershell'
 import { shell } from '@codemirror/legacy-modes/mode/shell'
 import { batchLanguage } from '../batch-mode.ts'
-import { apiGitBlame, apiRead, apiRun, apiWrite } from '../api.ts'
+import { apiGitBlame, apiRead, apiReadBinary, apiRun, apiWrite } from '../api.ts'
 import type { BlameLine, RunResult } from '../api.ts'
 import type { EditorTab } from '../store.ts'
 import { languageIdForPath } from '../../core/types.ts'
+import { isImagePath } from '../../core/media.ts'
+import { encodingLabel, TEXT_ENCODING_CHOICES } from '../../core/encoding.ts'
 import {
-  LspClient, completionInfo, completionType, normalizeUri, pathToUri,
-  type LspDiagnostic, type LspLocation, type LspPosition, type LspRange, type LspTextEdit,
+  LspClient, completionInfo, completionTextRange, completionType, normalizeUri, pathToUri, signatureParameterRange,
+  type LspDiagnostic, type LspLocation, type LspPosition, type LspRange, type LspSignatureHelp, type LspTextEdit,
 } from '../lsp-client.ts'
 import { TerminalPane } from './TerminalPane.tsx'
 
@@ -58,6 +61,8 @@ interface EditorPaneProps {
   onOpenFile: (path: string, line?: number) => void
   /** LSP 诊断推送上抛（写入 IdeState.diagnostics，供问题面板聚合）。 */
   onDiagnostics: (uri: string, diagnostics: LspDiagnostic[]) => void
+  /** 编码切换后以新内容整体替换 tab（content/encoding/mtime/dirty 一起更新）。 */
+  onReloadTab: (tab: EditorTab) => void
 }
 
 /** Pick a CodeMirror language by file extension. */
@@ -335,6 +340,74 @@ function renderHoverDom(contents: unknown): HTMLElement {
 /** 从 CodeMirror 状态里把 LSP hover 范围转成 tooltip 的 pos/end（可选）。
  *  注意：client 必须从 propsRef 读取（LSP 连接是异步建立的，mount 时可能
  *  还是 null；用闭包捕获会永远拿到 null → 悬停不工作）。 */
+const signatureTooltipEffect = StateEffect.define<Tooltip | null>()
+const signatureTooltipField = StateField.define<Tooltip | null>({
+  create: () => null,
+  update: (value, transaction) => {
+    for (const effect of transaction.effects) {
+      if (effect.is(signatureTooltipEffect)) return effect.value
+    }
+    return transaction.docChanged || transaction.selection !== undefined ? null : value
+  },
+})
+
+function shouldAutoCompleteAfterImport(doc: Text, pos: number): boolean {
+  const line = doc.lineAt(pos)
+  const before = doc.sliceString(line.from, pos)
+  if (!/[ .]$/.test(before)) return false
+  return /^\s*(?:from\s+[\w.]+\s+import|import(?:\s+[\w.]*)?)\s*$/.test(before)
+}
+
+function shouldRequestSignature(doc: Text, pos: number): boolean {
+  const line = doc.lineAt(pos)
+  const before = doc.sliceString(line.from, pos)
+  let depth = 0
+  for (let index = before.length - 1; index >= 0; index--) {
+    const char = before[index]
+    if (char === ')') depth += 1
+    else if (char === '(') {
+      if (depth === 0) return true
+      depth -= 1
+    }
+  }
+  return false
+}
+
+function renderSignatureDom(help: LspSignatureHelp): HTMLElement {
+  const container = document.createElement('div')
+  container.style.cssText = [
+    'max-width: 620px', 'max-height: 180px', 'overflow: auto', 'padding: 8px 10px',
+    'border-radius: 6px', 'background: var(--dsw-alias-bg-overlay, rgba(248,250,255,0.98))',
+    'color: var(--dsw-alias-label-primary, #1a1a1a)', 'border: 1px solid var(--ide-accent, #4f8cff)',
+    'box-shadow: 0 8px 24px rgba(0,0,0,0.28)', 'font: 13px/1.5 "Cascadia Code", Consolas, monospace',
+    'white-space: pre-wrap', 'word-break: break-word',
+  ].join('; ')
+  const value = signatureParameterRange(help)
+  if (value === null) return container
+  const label = document.createElement('div')
+  const before = value.activeFrom >= 0 ? value.label.slice(0, value.activeFrom) : value.label
+  const active = value.activeFrom >= 0 ? value.label.slice(value.activeFrom, value.activeTo) : ''
+  const after = value.activeFrom >= 0 ? value.label.slice(value.activeTo) : ''
+  label.append(document.createTextNode(before))
+  if (active !== '') {
+    const mark = document.createElement('strong')
+    mark.style.color = 'var(--ide-accent, #2563eb)'
+    mark.textContent = active
+    label.append(mark)
+  }
+  label.append(document.createTextNode(after))
+  container.append(label)
+  const documentation = value !== null ? help.signatures[help.activeSignature ?? 0]?.documentation : undefined
+  const info = completionInfo(documentation)
+  if (info !== undefined && info !== '') {
+    const doc = document.createElement('div')
+    doc.style.cssText = 'margin-top: 6px; color: #6b7280; font-family: inherit;'
+    doc.textContent = info
+    container.append(doc)
+  }
+  return container
+}
+
 function hoverTooltipFor(
   getClient: () => LspClient | null,
   path: () => string,
@@ -472,7 +545,8 @@ async function applyWorkspaceEdit(
         content = content.slice(0, start) + textEdit.newText + content.slice(end)
         lines.splice(0, lines.length, ...content.split('\n'))
       }
-      const written = await apiWrite(props.root, rel, content, read.value.mtime)
+      // 写回时沿用读取时的编码（非 UTF-8 文件被 LSP 跨文件编辑时保持原编码）。
+      const written = await apiWrite(props.root, rel, content, read.value.mtime, read.value.encoding)
       if (written.ok) touched += 1
     }
   }
@@ -535,12 +609,107 @@ async function codeActionsFor(
   }))
 }
 
+/** 位图预览（只读，VS Code 式）：滚轮缩放、双击回到适合窗口、底部信息条。
+ *  tab.content 为 data URL（host readBinary 返回 base64）。 */
+function ImagePreview({ tab }: { tab: EditorTab }): JSX.Element {
+  const [natural, setNatural] = useState<{ w: number; h: number } | null>(null)
+  const [scale, setScale] = useState(1)
+  const [fit, setFit] = useState(true)
+  const boxRef = useRef<HTMLDivElement | null>(null)
+
+  // 滚轮缩放：任意滚轮即缩放（预览区无滚动需求），退出「适合窗口」模式。
+  useEffect(() => {
+    const box = boxRef.current
+    if (box === null) return
+    const onWheel = (event: WheelEvent): void => {
+      event.preventDefault()
+      const factor = event.deltaY < 0 ? 1.1 : 1 / 1.1
+      setFit(false)
+      setScale((prev) => Math.min(8, Math.max(0.05, prev * factor)))
+    }
+    box.addEventListener('wheel', onWheel, { passive: false })
+    return () => box.removeEventListener('wheel', onWheel)
+  }, [])
+
+  const resetFit = (): void => {
+    setFit(true)
+    setScale(1)
+  }
+  const zoomStep = (dir: 1 | -1): void => {
+    setFit(false)
+    setScale((prev) => Math.min(8, Math.max(0.05, prev * (dir === 1 ? 1.25 : 0.8))))
+  }
+  const zoomLabel = fit ? '适合窗口' : `${Math.round(scale * 100)}%`
+  return (
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'hidden' }}>
+      <div
+        ref={boxRef}
+        style={{
+          flex: 1, minHeight: 0, overflow: 'auto', display: 'flex', alignItems: 'center', justifyContent: 'center',
+          background: 'var(--dsw-alias-bg-base,#ffffff)',
+        }}
+      >
+        <img
+          src={tab.content}
+          alt={tab.title}
+          draggable={false}
+          onLoad={(event) => {
+            const img = event.currentTarget
+            setNatural({ w: img.naturalWidth, h: img.naturalHeight })
+          }}
+          onDoubleClick={resetFit}
+          title="双击回到适合窗口"
+          style={{
+            maxWidth: fit ? '100%' : undefined,
+            maxHeight: fit ? '100%' : undefined,
+            width: !fit && natural !== null ? Math.max(1, Math.round(natural.w * scale)) : undefined,
+            height: !fit && natural !== null ? 'auto' : undefined,
+            objectFit: 'contain', userSelect: 'none', cursor: 'zoom-in', flexShrink: 0,
+          }}
+        />
+      </div>
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 10, padding: '4px 10px', flexShrink: 0,
+        fontSize: 12, color: '#6b7280', borderTop: '1px solid var(--ide-border,#e5e6eb)',
+      }}>
+        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{tab.path}</span>
+        <span>{natural !== null ? `${natural.w} × ${natural.h} px` : '加载中…'}</span>
+        <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center' }}>
+          <button
+            onClick={() => zoomStep(-1)}
+            title="缩小"
+            style={{ padding: '1px 8px', fontSize: 12, cursor: 'pointer', color: '#6b7280', background: 'transparent', border: '1px solid var(--ide-border,#e5e6eb)', borderRadius: 4, fontFamily: 'inherit' }}
+          >−</button>
+          <span style={{ minWidth: 56, textAlign: 'center' }}>{zoomLabel}</span>
+          <button
+            onClick={() => zoomStep(1)}
+            title="放大"
+            style={{ padding: '1px 8px', fontSize: 12, cursor: 'pointer', color: '#6b7280', background: 'transparent', border: '1px solid var(--ide-border,#e5e6eb)', borderRadius: 4, fontFamily: 'inherit' }}
+          >+</button>
+          <button
+            onClick={resetFit}
+            title="缩放到适合窗口"
+            style={{ padding: '1px 8px', fontSize: 12, cursor: 'pointer', color: '#6b7280', background: 'transparent', border: '1px solid var(--ide-border,#e5e6eb)', borderRadius: 4, fontFamily: 'inherit' }}
+          >⤢ 适合</button>
+          <button
+            onClick={() => { setFit(false); setScale(1) }}
+            title="显示原始大小"
+            style={{ padding: '1px 8px', fontSize: 12, cursor: 'pointer', color: '#6b7280', background: 'transparent', border: '1px solid var(--ide-border,#e5e6eb)', borderRadius: 4, fontFamily: 'inherit' }}
+          >1:1 原始</button>
+        </span>
+      </div>
+    </div>
+  )
+}
+
 /** One CodeMirror instance per tab. The parent remounts this component via
  * `key={tab.id}` on tab switch; the view is created once on mount and
  * destroyed on unmount (non-controlled: doc flows out via updateListener). */
 function CodeMirrorPane({ tab, onContentChange, onSave, onContextAction, lsp, diagnostics, onOpenLocation, revealLine, onRevealDone, root, onCursor, fontSize, onFontSizeChange, blame, blameEnabled }: CodeMirrorPaneProps): JSX.Element {
   const hostRef = useRef<HTMLDivElement | null>(null)
   const viewRef = useRef<EditorView | null>(null)
+  const signatureRequestRef = useRef(0)
+  const completionRequestRef = useRef(0)
   // 右键菜单：无选中时也弹出（重命名/格式化/快速修复）；text 为空表示无选中。
   const [menu, setMenu] = useState<{ text: string; x: number; y: number } | null>(null)
   // 快速修复子菜单（光标处 codeAction 列表）
@@ -621,6 +790,11 @@ function CodeMirrorPane({ tab, onContentChange, onSave, onContextAction, lsp, di
       doc: propsRef.current.tab.content,
       extensions: [
         basicSetup,
+        // VS Code 习惯：缩进单位 4 空格、Tab 字符显示宽 4（CodeMirror 默认
+        // indentUnit 是 2 空格——这正是「Enter 换行只缩进两格」的根因）。
+        // 语言包未自设 indentUnit 时全局生效；indentMore/indentLess 也按它插入。
+        indentUnit.of('    '),
+        EditorState.tabSize.of(4),
         languageFor(propsRef.current.tab.path),
         // 注意：不能带 { fallback: true } —— 那会让语言自带高亮器（lang-* 的默认配色）优先，
         // 自定义配色完全失效；不带 fallback 时本高亮器与语言高亮并列，注册靠后 CSS 优先
@@ -630,6 +804,9 @@ function CodeMirrorPane({ tab, onContentChange, onSave, onContextAction, lsp, di
         // (blameEnabled, blame) 动态 reconfigure —— 未启用时整个 gutter 列
         // 不渲染（不占空间），启用且有数据时才挂载。
         blameCompartmentRef.current!.of([]),
+        tooltips({ position: 'fixed', tooltipSpace: (view) => view.dom.getBoundingClientRect() }),
+        signatureTooltipField,
+        showTooltip.from(signatureTooltipField),
         EditorView.theme({
           '&': {
             height: '100%', fontSize: 'var(--ide-editor-font-size, 13px)',
@@ -664,10 +841,26 @@ function CodeMirrorPane({ tab, onContentChange, onSave, onContextAction, lsp, di
             key: 'Mod-s',
             run: () => { propsRef.current.onSave(propsRef.current.tab); return true },
           },
-          // VS Code 习惯：Tab 接受补全（补全未打开时返回 false → 放行默认缩进）。
+          // VS Code 习惯：Tab 先跳 snippet 占位符（补全带 ${1:} 时），否则接受
+          // 补全（未打开时 acceptCompletion 返回 false）；最后落到 indentMore 缩进
+          // （此前直接返回 false → 焦点被移出编辑器，Tab 无法缩进）。Shift+Tab
+          // 反向跳 snippet 占位符 / indentLess 反缩进。
           {
             key: 'Tab',
-            run: (view) => acceptCompletion(view),
+            run: (view) => {
+              if (hasNextSnippetField(view.state)) return nextSnippetField(view)
+              if (acceptCompletion(view)) return true
+              return indentMore(view)
+            },
+            shift: (view) => {
+              if (hasPrevSnippetField(view.state)) return prevSnippetField(view)
+              return indentLess(view)
+            },
+          },
+          // Ctrl+Space：手动请求补全，尤其覆盖 import 后的空前缀场景。
+          {
+            key: 'Mod-Space',
+            run: (view) => startCompletion(view),
           },
           // F12：跳转定义。
           {
@@ -720,19 +913,41 @@ function CodeMirrorPane({ tab, onContentChange, onSave, onContextAction, lsp, di
               line: context.state.doc.lineAt(context.pos).number - 1,
               character: context.pos - context.state.doc.lineAt(context.pos).from,
             }
+            const requestDoc = context.state.doc.toString()
+            const requestId = ++completionRequestRef.current
             return client.completion(path, position).then((items) => {
-              if (items === null) return null
+              // 竞态作废：新请求（source 内 ++）会使旧响应的 requestId 失效；
+              // 此处不能再由 updateListener 递增（autocompletion 先于本 updateListener
+              // 触发 source，若再 ++ 会作废刚发出的请求 → 补全永不显示）。
+              if (requestId !== completionRequestRef.current || items === null) return null
               const word = matchWordAt(context)
+              const fallback = { from: word !== null ? word.from : context.pos, to: context.pos }
               return {
-                from: word !== null ? word.from : context.pos,
-                options: items.map((item) => ({
-                  label: item.label,
-                  type: completionType(item.kind),
-                  detail: item.detail,
-                  info: completionInfo(item.documentation),
-                  apply: item.textEdit?.newText ?? item.insertText ?? item.label,
-                  boost: item.sortText !== undefined ? 0 : 1,
-                })),
+                from: fallback.from,
+                to: fallback.to,
+                options: items.map((item) => {
+                  const range = completionTextRange(item, requestDoc, fallback)
+                  const replacement = item.textEdit?.newText ?? item.insertText ?? item.label
+                  const isSnippet = item.insertTextFormat === 2 && replacement !== item.label
+                  return {
+                    label: item.label,
+                    type: completionType(item.kind),
+                    detail: item.detail,
+                    info: completionInfo(item.documentation),
+                    // snippet 模板（${1:...}）只在替换范围与词范围一致时启用占位符
+                    // 跳转；范围不一致（如 import 类插入）用纯文本替换保证落点正确。
+                    apply: range.from === fallback.from && range.to === fallback.to
+                      ? isSnippet
+                        ? snippet(replacement).apply
+                        : replacement
+                      : (view: EditorView) => {
+                          view.dispatch({ changes: { from: range.from, to: range.to, insert: replacement } })
+                        },
+                    commitCharacters: item.commitCharacters,
+                    sortText: item.sortText,
+                    boost: item.sortText !== undefined ? 0 : 1,
+                  }
+                }),
               }
             })
           }],
@@ -741,11 +956,40 @@ function CodeMirrorPane({ tab, onContentChange, onSave, onContextAction, lsp, di
         // publishDiagnostics 后 setState → 本组件重渲染 → forceLinting 刷新）。
         ...(lspEnabled ? [linter((view) => propsRef.current.diagnostics.map((d) => toCmDiagnostic(view.state.doc, d)))] : []),
         EditorView.updateListener.of((update) => {
+          if (update.selectionSet || update.docChanged) {
+            const head = update.state.selection.main.head
+            // 注意：这里不能再递增 completionRequestRef —— autocompletion 扩展先于
+            // 本 updateListener 触发补全 source，递增会把刚发出的请求作废（补全全消失）。
+            const requestId = ++signatureRequestRef.current
+            const shouldShow = shouldRequestSignature(update.state.doc, head)
+            if (!shouldShow || propsRef.current.lsp === null) {
+              update.view.dispatch({ effects: signatureTooltipEffect.of(null) })
+            } else {
+              const line = update.state.doc.lineAt(head)
+              const position: LspPosition = { line: line.number - 1, character: head - line.from }
+              const path = propsRef.current.tab.path
+              void propsRef.current.lsp.signatureHelp(path, position).then((help) => {
+                if (requestId !== signatureRequestRef.current || help === null || help.signatures.length === 0) return
+                update.view.dispatch({ effects: signatureTooltipEffect.of({
+                  pos: head,
+                  above: false,
+                  strictSide: false,
+                  arrow: true,
+                  create: () => ({ dom: renderSignatureDom(help) }),
+                }) })
+              })
+            }
+          }
           if (update.docChanged) {
             const content = update.state.doc.toString()
             propsRef.current.onContentChange(propsRef.current.tab.id, content)
             // 同步全量文本给 LSP（didChange，版本号内部递增）。
             propsRef.current.lsp?.updateDocument(propsRef.current.tab.path, content)
+             // import/from import 后的空前缀需要主动唤起补全；CodeMirror 默认只在
+             // 标识符输入后触发，刚输入空格时容易不弹出候选。
+             if (shouldAutoCompleteAfterImport(update.state.doc, update.state.selection.main.head)) {
+               startCompletion(update.view)
+             }
           }
           if (update.selectionSet || update.docChanged) {
             const head = update.state.selection.main.head
@@ -1120,7 +1364,7 @@ function resizeHandleStyle(): React.CSSProperties {
 }
 
 export function EditorPane({
-  root, tabs, activeTabId, onActivate, onClose, onContentChange, onDirtySave, onCloseEditor, onAskAgent, onOpenFile, onDiagnostics,
+  root, tabs, activeTabId, onActivate, onClose, onContentChange, onDirtySave, onCloseEditor, onAskAgent, onOpenFile, onDiagnostics, onReloadTab,
 }: EditorPaneProps): JSX.Element {
   const activeTab = tabs.find((tab) => tab.id === activeTabId) ?? null
   const [status, setStatus] = useState('')
@@ -1132,20 +1376,21 @@ export function EditorPane({
   const [outputHeight, setOutputHeight] = useState(200)
   // 终端「立即 fit」触发器：手柄松手时 +1，TerminalPane 跳过防抖立即 fit+resize
   const [termFitTick, setTermFitTick] = useState(0)
-  // LSP：每 root 三个语言服务器客户端（ts = typescript-language-server，
-  // py = pyright，ps = PowerShell Editor Services），按当前文件类型选用；
-  // 诊断按 uri 缓存（共享一个 map）。
+  // LSP：每 root 四个语言服务器客户端（ts / py / ps / java），按当前文件类型选用；
+  // 诊断按 uri 缓存（共享一个 map）。Java LSP 是可选能力，找不到 JDTLS 时纯高亮降级。
   const [tsLsp, setTsLsp] = useState<LspClient | null>(null)
   const [pyLsp, setPyLsp] = useState<LspClient | null>(null)
   const [psLsp, setPsLsp] = useState<LspClient | null>(null)
+  const [javaLsp, setJavaLsp] = useState<LspClient | null>(null)
   const [diagMap, setDiagMap] = useState<Map<string, LspDiagnostic[]>>(new Map())
-  // LSP 状态按服务器分槽（ts/py/ps 各自独立）——避免一个服务器失败时
-  // 状态栏把错误盖到其他语言上（如 PSES 失败却显示在打开的 .ts 文件上）。
-  const [lspStatus, setLspStatus] = useState<{ ts?: string; py?: string; ps?: string }>({})
+  // LSP 状态按服务器分槽（各自独立），避免一个服务器失败时盖住其他语言。
+  const [lspStatus, setLspStatus] = useState<{ ts?: string; py?: string; ps?: string; java?: string }>({})
   // 服务器完整错误日志（window/logMessage type 3），状态栏 hover 可见全文。
   const [lspFullError, setLspFullError] = useState<Record<string, string>>({})
   // 状态栏：光标行列
   const [cursorPos, setCursorPos] = useState<{ line: number; column: number } | null>(null)
+  // 编码选择菜单（状态栏点击编码弹出；坐标为触发元素位置，portal 定位于其上方）。
+  const [encMenu, setEncMenu] = useState<{ x: number; y: number } | null>(null)
   // 编辑器字号（px）：Ctrl/Cmd+滚轮调整，localStorage 记忆（VS Code 习惯）。
   const [editorFontSize, setEditorFontSize] = useState(() => {
     const saved = Number.parseInt(localStorage.getItem('dsh-ide-editor-font-size') ?? '', 10)
@@ -1173,7 +1418,7 @@ export function EditorPane({
   // 拉取当前文件 blame：root / 文件 / 保存后 变化时重取。编辑中（dirty）不清
   // 除则行号会与 blame 错位，由 onContentChange 处理（见 handleContentChange）。
   useEffect(() => {
-    if (root === '' || activeTab === null || activeTab.truncated === true) {
+    if (root === '' || activeTab === null || activeTab.truncated === true || activeTab.kind === 'image') {
       setBlame(null)
       return
     }
@@ -1192,26 +1437,27 @@ export function EditorPane({
   }, [root, activeTab?.path, blameTick])
 
   // 当前文件的 LSP 客户端：仅对 languageIdForPath() 支持的语言返回客户端
-  // （ts / py / ps），其余语言返回 null
-  // （P2-04：md/go/rust 等不再误拿 TS client）。
+  // （ts / py / ps / java），其余语言返回 null。
   const lspFor = (path: string): LspClient | null => {
     const language = languageIdForPath(path)
     if (language === null) return null
     if (language === 'python') return pyLsp
     if (language === 'powershell') return psLsp
+    if (language === 'java') return javaLsp
     return tsLsp
   }
 
-  // 每 root 三个 LSP 会话：root 变化时重建（旧实例 dispose）。
+  // 每 root 四个 LSP 会话：root 变化时重建（旧实例 dispose）。
   useEffect(() => {
     if (root === '') {
       setTsLsp(null)
       setPyLsp(null)
       setPsLsp(null)
+      setJavaLsp(null)
       setDiagMap(new Map())
       return
     }
-    const makeClient = (server: 'ts' | 'py' | 'ps'): LspClient => new LspClient({
+    const makeClient = (server: 'ts' | 'py' | 'ps' | 'java'): LspClient => new LspClient({
       root,
       rootUri: pathToUri(root, ''),
       server,
@@ -1234,21 +1480,26 @@ export function EditorPane({
     const ts = makeClient('ts')
     const py = makeClient('py')
     const ps = makeClient('ps')
+    const java = makeClient('java')
     setTsLsp(ts)
     setPyLsp(py)
     setPsLsp(ps)
+    setJavaLsp(java)
     setDiagMap(new Map())
-    setLspStatus({ ts: '连接中…', py: '连接中…', ps: '连接中…' })
+    setLspStatus({ ts: '连接中…', py: '连接中…', ps: '连接中…', java: '连接中…' })
     ts.connect()
     py.connect()
     ps.connect()
+    java.connect()
     return () => {
       ts.dispose()
       py.dispose()
       ps.dispose()
+      java.dispose()
       setTsLsp(null)
       setPyLsp(null)
       setPsLsp(null)
+      setJavaLsp(null)
     }
   }, [root])
 
@@ -1277,6 +1528,13 @@ export function EditorPane({
 
   /** 保存并返回是否成功（供「运行前保存」与 Ctrl+S 共用）。 */
   const saveNow = async (tab: EditorTab): Promise<boolean> => {
+    // 图片 tab 为只读预览，禁止保存。
+    if (tab.kind === 'image') {
+      setStatus(`⚠ ${tab.path} 是图片预览，不可保存`)
+      if (saveTimer.current !== undefined) clearTimeout(saveTimer.current)
+      saveTimer.current = setTimeout(() => setStatus(''), 2500)
+      return false
+    }
     // P1-04：截断文件只读，禁止保存（防尾部数据被覆盖丢失）。
     if (tab.truncated === true) {
       setStatus(`⚠ ${tab.path} 过大已被截断，只读不可保存`)
@@ -1284,7 +1542,8 @@ export function EditorPane({
       saveTimer.current = setTimeout(() => setStatus(''), 4000)
       return false
     }
-    const result = await apiWrite(root, tab.path, tab.content, tab.savedMtime)
+    // 按 tab 的编码写回（默认 UTF-8；GBK 等文件保持原编码）。
+    const result = await apiWrite(root, tab.path, tab.content, tab.savedMtime, tab.encoding ?? 'utf-8')
     if (result.ok) {
       onDirtySave({ ...tab, savedMtime: result.value.mtime })
       setStatus(`已保存 ${tab.path}`)
@@ -1306,8 +1565,14 @@ export function EditorPane({
    *  P1-02：首次运行时确认（localStorage 记忆），运行是本机高权限执行入口。 */
   const runActive = async (): Promise<void> => {
     if (activeTab === null || output?.state === 'running') return
+    if (activeTab.kind === 'image') {
+      setStatus('图片为只读预览，不可运行')
+      if (saveTimer.current !== undefined) clearTimeout(saveTimer.current)
+      saveTimer.current = setTimeout(() => setStatus(''), 2500)
+      return
+    }
     if (localStorage.getItem('dsh-ide-run-confirmed') !== '1') {
-      if (!window.confirm('运行将在本机执行脚本（node/python/pwsh）。确认允许运行？')) return
+      if (!window.confirm('运行将在本机执行程序（node/ts/python/pwsh/java）。确认允许运行？')) return
       localStorage.setItem('dsh-ide-run-confirmed', '1')
     }
     if (activeTab.dirty && !(await saveNow(activeTab))) {
@@ -1325,6 +1590,56 @@ export function EditorPane({
     if (saveTimer.current !== undefined) clearTimeout(saveTimer.current)
     save(tab)
   }
+
+  /**
+   * 切换文件编码：以新编码重新读取文件并整体替换 tab（未保存修改先确认丢弃）。
+   * id 为 'auto' 时让 host 自动检测实际编码（乱码场景），检测结果存回 tab.encoding。
+   * CodeMirrorPane 以 key 包含 encoding，切换后自动重建并以新内容重新打开。
+   */
+  const switchEncoding = async (id: string): Promise<void> => {
+    const tab = activeTab
+    if (tab === null || tab.kind === 'image') return
+    if (tab.dirty && !window.confirm('切换编码将以新编码重新加载文件，当前未保存的修改将丢失。确定继续？')) {
+      return
+    }
+    const result = await apiRead(root, tab.path, id)
+    if (!result.ok) {
+      setStatus(`切换编码失败: ${result.error.message}`)
+      if (saveTimer.current !== undefined) clearTimeout(saveTimer.current)
+      saveTimer.current = setTimeout(() => setStatus(''), 3500)
+      return
+    }
+    onReloadTab({
+      ...tab,
+      content: result.value.content,
+      encoding: result.value.encoding,
+      savedMtime: result.value.mtime,
+      dirty: false,
+      truncated: result.value.truncated,
+    })
+    setStatus(`已用 ${encodingLabel(result.value.encoding)} 重新加载 ${tab.title}`)
+    if (saveTimer.current !== undefined) clearTimeout(saveTimer.current)
+    saveTimer.current = setTimeout(() => setStatus(''), 2500)
+  }
+
+  // 编码菜单：外部点击（菜单内除外）或 Esc 关闭。
+  useEffect(() => {
+    if (encMenu === null) return
+    const onDown = (event: MouseEvent): void => {
+      const target = event.target as HTMLElement | null
+      if (target !== null && target.closest('[data-ide-editor-menu]') !== null) return
+      setEncMenu(null)
+    }
+    const onKey = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') setEncMenu(null)
+    }
+    window.addEventListener('mousedown', onDown)
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('mousedown', onDown)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [encMenu])
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
@@ -1364,12 +1679,12 @@ export function EditorPane({
         <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8, paddingRight: 8, flexShrink: 0 }}>
           <button
             onClick={() => { if (activeTab !== null) requestSave(activeTab) }}
-            disabled={activeTab === null || !activeTab.dirty}
-            title={activeTab === null ? '先打开一个文件' : activeTab.dirty ? `保存 ${activeTab.path}（Ctrl+S）` : '没有未保存的更改'}
+            disabled={activeTab === null || !activeTab.dirty || activeTab.kind === 'image'}
+            title={activeTab === null ? '先打开一个文件' : activeTab.kind === 'image' ? '图片为只读预览，不可保存' : activeTab.dirty ? `保存 ${activeTab.path}（Ctrl+S）` : '没有未保存的更改'}
             style={{
               padding: '4px 10px', fontSize: 12,
-              cursor: activeTab !== null && activeTab.dirty ? 'pointer' : 'default',
-              color: activeTab !== null && activeTab.dirty ? '#16a34a' : '#9ca3af',
+              cursor: activeTab !== null && activeTab.dirty && activeTab.kind !== 'image' ? 'pointer' : 'default',
+              color: activeTab !== null && activeTab.dirty && activeTab.kind !== 'image' ? '#16a34a' : '#9ca3af',
               background: 'transparent', border: '1px solid var(--ide-border,#e5e6eb)',
               borderRadius: 4, whiteSpace: 'nowrap',
             }}
@@ -1390,11 +1705,12 @@ export function EditorPane({
           </button>
           <button
             onClick={() => { void runActive() }}
-            disabled={activeTab === null || output?.state === 'running'}
-            title={activeTab === null ? '先打开一个文件' : `运行 ${activeTab.path}`}
+            disabled={activeTab === null || output?.state === 'running' || activeTab.kind === 'image'}
+            title={activeTab === null ? '先打开一个文件' : activeTab.kind === 'image' ? '图片为只读预览，不可运行' : `运行 ${activeTab.path}`}
             style={{
-              padding: '4px 10px', fontSize: 12, cursor: activeTab === null ? 'default' : 'pointer',
-              color: activeTab === null ? '#9ca3af' : 'var(--ide-hl-keyword, #0000FF)',
+              padding: '4px 10px', fontSize: 12,
+              cursor: activeTab === null || activeTab.kind === 'image' ? 'default' : 'pointer',
+              color: activeTab === null || activeTab.kind === 'image' ? '#9ca3af' : 'var(--ide-hl-keyword, #0000FF)',
               background: 'transparent', border: '1px solid var(--ide-border,#e5e6eb)',
               borderRadius: 4, whiteSpace: 'nowrap',
             }}
@@ -1435,9 +1751,12 @@ export function EditorPane({
           <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#9ca3af', fontSize: 14 }}>
             选择左侧文件开始编辑
           </div>
+        ) : activeTab.kind === 'image' ? (
+          <ImagePreview tab={activeTab} />
         ) : (
           <CodeMirrorPane
-            key={activeTab.id}
+            // key 含编码：切换编码时强制重建（新 content 重新打开；普通编辑不变）。
+            key={`${activeTab.id}::${activeTab.encoding ?? 'utf-8'}`}
             tab={activeTab}
             onContentChange={(id, content) => {
               onContentChange(id, content)
@@ -1551,9 +1870,9 @@ export function EditorPane({
         <span style={{ display: 'flex', gap: 12, alignItems: 'center', overflow: 'hidden' }}>
           <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{root}</span>
           {activeTab !== null && languageIdForPath(activeTab.path) !== null && (() => {
-            // 按当前文件语言显示对应语言服务器的状态（ts/py/ps 分槽，互不污染）。
+            // 按当前文件语言显示对应语言服务器的状态（各语言分槽，互不污染）。
             const language = languageIdForPath(activeTab.path)
-            const server = language === 'python' ? 'py' : language === 'powershell' ? 'ps' : 'ts'
+            const server = language === 'python' ? 'py' : language === 'powershell' ? 'ps' : language === 'java' ? 'java' : 'ts'
             const status = lspStatus[server] ?? ''
             return (
               <span title={lspFullError[server] !== undefined ? lspFullError[server] : '语言服务器状态'}>
@@ -1563,7 +1882,9 @@ export function EditorPane({
           })()}
         </span>
         <span style={{ display: 'flex', gap: 12, alignItems: 'center', flexShrink: 0 }}>
-          {activeTab !== null && (
+          {activeTab !== null && (activeTab.kind === 'image' ? (
+            <span title="位图预览（只读，滚轮缩放，双击回到适合窗口）">图片预览</span>
+          ) : (
             <>
               <span title="光标位置">{cursorPos !== null ? `行 ${cursorPos.line}, 列 ${cursorPos.column}` : ''}</span>
               {(() => {
@@ -1584,6 +1905,16 @@ export function EditorPane({
               })()}
               <span title={`编辑器字号（Ctrl+滚轮调整）: ${editorFontSize}px`}>{editorFontSize}px</span>
               <span title="语言">{languageIdForPath(activeTab.path) ?? 'plaintext'}</span>
+              <span
+                title="文件编码，点击选择（以新编码重新加载）"
+                onClick={(event) => {
+                  const rect = (event.currentTarget as HTMLElement).getBoundingClientRect()
+                  setEncMenu({ x: rect.left, y: rect.top - 4 })
+                }}
+                style={{ cursor: 'pointer', borderBottom: '1px dotted var(--ide-muted,#9ca3af)' }}
+              >
+                {encodingLabel(activeTab.encoding ?? 'utf-8')}
+              </span>
               {(() => {
                 const list = diagMap.get(normalizeUri(pathToUri(root, activeTab.path))) ?? []
                 const errors = list.filter((d) => d.severity === 1).length
@@ -1597,10 +1928,38 @@ export function EditorPane({
                 )
               })()}
             </>
-          )}
-          <span>{status !== '' ? status : (activeTab !== null ? (activeTab.dirty ? '未保存' : '已保存') : '')}</span>
+          ))}
+          <span>{status !== '' ? status : (activeTab !== null ? (activeTab.kind === 'image' ? '图片' : activeTab.dirty ? '未保存' : '已保存') : '')}</span>
         </span>
       </div>
+      {/* 编码选择菜单（状态栏点击编码弹出，选择后以新编码重新加载当前文件） */}
+      {encMenu !== null && createPortal(
+        <div
+          data-ide-editor-menu=""
+          style={{
+            position: 'fixed',
+            left: Math.max(4, Math.min(encMenu.x, window.innerWidth - 240)),
+            top: Math.max(4, encMenu.y),
+            zIndex: 1000, minWidth: 230, maxHeight: 280, overflow: 'auto', padding: '4px 0',
+            background: 'var(--dsw-alias-bg-overlay, rgba(248,250,255,0.98))',
+            color: 'var(--dsw-alias-label-primary, #1a1a1a)',
+            border: '1px solid var(--ide-border,#e5e6eb)', borderRadius: 6,
+            boxShadow: '0 8px 24px rgba(0,0,0,0.28)', fontSize: 13, fontFamily: 'inherit',
+          }}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          <div style={{ padding: '4px 14px', fontSize: 11, color: '#9ca3af' }}>选择编码（重新加载文件）</div>
+          {TEXT_ENCODING_CHOICES.map((choice) => (
+            <MenuItemButton
+              key={choice.id}
+              onClick={() => { const m = encMenu; setEncMenu(null); if (m !== null) void switchEncoding(choice.id) }}
+            >
+              {choice.id === (activeTab?.encoding ?? 'utf-8') ? '✓ ' : ''}{choice.label}
+            </MenuItemButton>
+          ))}
+        </div>,
+        document.body,
+      )}
     </div>
   )
 }
@@ -1617,6 +1976,27 @@ export async function openFileInTabs(
   path: string,
   onUpdate: (updater: (prev: { tabs: EditorTab[]; activeTabId: string | null }) => { tabs: EditorTab[]; activeTabId: string | null }) => void,
 ): Promise<void> {
+  // 位图图片：按二进制读取（base64 data URL），编辑器内做只读预览，不走文本解码。
+  if (isImagePath(path)) {
+    const binary = await apiReadBinary(root, path)
+    if (!binary.ok) return
+    const tab: EditorTab = {
+      id: `file:${path}`,
+      path,
+      title: tabTitle(path),
+      content: `data:${binary.value.mime};base64,${binary.value.data}`,
+      dirty: false,
+      savedMtime: binary.value.mtime,
+      truncated: false,
+      kind: 'image',
+    }
+    onUpdate((prev) => {
+      const existing = prev.tabs.find((item) => item.path === path)
+      if (existing !== undefined) return { tabs: prev.tabs, activeTabId: existing.id }
+      return { tabs: [...prev.tabs, tab], activeTabId: tab.id }
+    })
+    return
+  }
   const result = await apiRead(root, path)
   if (!result.ok) return
   const truncated = result.value.truncated === true
@@ -1628,6 +2008,8 @@ export async function openFileInTabs(
     dirty: false,
     savedMtime: result.value.mtime,
     truncated,
+    kind: 'text',
+    encoding: result.value.encoding ?? 'utf-8',
   }
   onUpdate((prev) => {
     // 已存在（并发打开同一文件）→ 只激活不覆盖。

@@ -454,15 +454,9 @@ export function FileTree({ root, treeTick = 0, onOpenFile }: FileTreeProps): JSX
               <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{rootName}</span>
               {copied === '' && <span style={{ marginLeft: 'auto', color: '#16a34a', fontSize: 11 }}>已复制</span>}
             </div>
-            {editing !== null && editing.mode !== 'rename' && editing.parent === '' && (
-              <EditRow
-                depth={1}
-                initial=""
-                placeholder={editing.mode === 'new-file' ? '文件名' : '文件夹名'}
-                onCommit={commitEdit}
-                onCancel={() => setEditing(null)}
-              />
-            )}
+            {/* 根目录的新建输入框由 renderChildren 统一渲染（dir='' 时 showingNew 分支），
+                这里不再单独渲染，避免与 renderChildren 重复挂载两个 EditRow——
+                第二个 focus 触发第一个 onBlur 取消，导致根目录无法新建文件/文件夹。 */}
             {renderChildren({
               dir: '',
               depth: 0,

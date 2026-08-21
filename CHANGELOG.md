@@ -2,12 +2,27 @@
 
 本项目版本与更新记录。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.3.0] - 2026-08-21
+
+### 新增
+
+- **编辑器编码选择**：状态栏显示当前文件编码（默认 UTF-8），点击弹出编码菜单——UTF-8 / 自动检测 / GB18030 / GBK / Big5 / UTF-16 LE / ISO-8859-1；切换后以新编码重新加载文件（未保存修改先确认），保存时按所选编码写回（GBK 等中文旧文件不再乱码、不会保存成 UTF-8）；「自动检测」对乱码文件先做严格 UTF-8 校验，失败则按 GB18030 解码，检测结果回写状态栏；读取时剥离 BOM、UTF-16LE 写入带 BOM
+- **图片预览**：文件树双击 png / jpg / jpeg / gif / webp / bmp / ico / avif 直接在编辑区显示图片（不再是乱码）；滚轮缩放、双击回到适合窗口、底部工具栏缩放 / 适合 / 1:1 原始大小；只读不可保存/运行；host 侧按扩展名白名单限定 MIME 并限制 25MB，防任意文件被当图片读取
+- **Tab 键缩进**：无补全/snippet 时 Tab 缩进、Shift+Tab 反缩进（多行选中整块缩进），行为对齐 VS Code
+
+### 修复
+
+- **Enter 换行只缩进 2 空格**：CodeMirror 全局 `indentUnit` 默认为 2 空格且项目未显式设置——统一为 4 空格（`indentUnit.of('    ')` + `EditorState.tabSize.of(4)`），语言包未自设缩进单位的语言（含 Python 循环/分支自动缩进）全部按 4 空格
+- **Tab 无法缩进**：原 keymap 在无补全时返回 `false`，CodeMirror 默认行为把焦点移出编辑器——补上 `indentMore` / `indentLess` fallback
+
 ## [0.2.0] - 2026-08-20
 
 ### 新增
 
 - **GitLens 式行内 blame**：编辑器左侧 gutter 逐行标注「短 hash + 作者」（未提交行显示「未提交」），悬停浮层显示完整提交信息（提交/作者/日期/说明）；状态栏光标行显示「◉ 作者 · 相对时间 · 短 hash」；嵌套仓库自动定位（工作区根非 Git 仓库时从文件向上找最近仓库根）；整文件标注默认关闭（工具栏「○ Blame」开关，localStorage 记忆，未启用时整列不渲染）
 - **PowerShell 语言智能**（PowerShell Editor Services v4.7.0 + PSScriptAnalyzer）：`.ps1` / `.psm1` / `.psd1` 的补全、悬停帮助、实时语义分析（Script Analyzer 波浪线）、跳转定义、格式化、重命名、快速修复；捆绑模块放在插件 `vendor/` 目录（从 GitHub releases / PSGallery 手动更新，不入 git 仓库）
+- **Java 语言智能**：接入 Eclipse JDT Language Server；优先复用本机 Red Hat VS Code Java 扩展中的 JDTLS（JDK 21+），支持通过 `DSH_JAVA_LS_HOME` 指定；未安装 JDTLS 时自动降级为 Java 语法高亮
+- **Java 单文件运行**：点击运行后用 `javac` 编译到系统临时目录，再用 `java` 执行；支持 `package` 声明，Maven/Gradle 项目请使用终端
 - **终端右键菜单**：复制选中 / 粘贴 / 清屏 / **🔄 重启终端**（立即杀掉当前 shell 并重连全新 shell，无需重启 DSH）
 - 编辑器右键菜单选项悬停背景加深
 

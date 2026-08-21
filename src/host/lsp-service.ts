@@ -13,6 +13,10 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { existsSync, readdirSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import { type IncomingMessage } from 'node:http'
@@ -22,26 +26,101 @@ import type { FsService } from './fs-service.ts'
 import { languageIdForPath } from '../core/types.ts'
 import { closeWs } from './ws-safe.ts'
 
+/** Server kind → 启动配置：命令 + 参数构造。 */
+type ServerLauncher = { command: string; args: (root: string) => string[] }
+
 /**
- * Server kind → 启动配置：命令 + 参数构造。
- * - ts / py：Node 语言服务器（`process.execPath` 以 Node 模式跑 JS 入口，--stdio）。
- * - ps：PowerShell Editor Services 不是 Node 程序，用 `pwsh` 跑捆绑在插件
- *   vendor/ 的 Start-EditorServices.ps1（-Stdio 走标准输入输出，正合本桥）。
- *   ⚠️ BundledModulesPath 必须指向「包含 PowerShellEditorServices 与
- *   PSScriptAnalyzer 的父目录」（PSES 硬编码找 BundledModulesPath/PSScriptAnalyzer），
- *   不是 PSES 自身目录——指错会导致分析器缺失、启动 CommandNotFound 退出。
- *   vendor 从 GitHub releases / PSGallery 手动更新（.gitignore，不入库）。
- *   ⚠️ 相对路径以**构建产物位置（lib/）**为基准：lib 在插件根下，用 '../vendor'
- *   （= 插件根/vendor）；不要写 '../../vendor'——那是源码 src/host/ 的深度，
- *   打包后运行在 lib/ 会多上跳一级指到父目录（实测 Start-EditorServices.ps1
- *   找不到，PSES 直接 CommandNotFound 退出）。
+ * 可选的 Java LSP：优先使用 DSH_JAVA_LS_HOME，其次复用本机已安装的
+ * Red Hat VS Code Java 扩展中的 Eclipse JDT Language Server。插件不把数百 MB
+ * 的 JDTLS 放进 npm 包；未找到时 Java 仍保留 CodeMirror 语法高亮，只是不启动 LSP。
  */
-const SERVER_LAUNCHERS: Record<string, { command: string; args: () => string[] }> = (() => {
+function findJavaLauncher(): ServerLauncher | null {
+  const candidates: string[] = []
+  const javaFor = (extensionRoot: string): string => {
+    const explicitHome = process.env.DSH_JAVA_HOME
+    if (explicitHome !== undefined && explicitHome !== '') {
+      return join(explicitHome, 'bin', process.platform === 'win32' ? 'java.exe' : 'java')
+    }
+    const jreRoot = join(extensionRoot, 'jre')
+    try {
+      const bundled = readdirSync(jreRoot, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => join(jreRoot, entry.name, 'bin', process.platform === 'win32' ? 'java.exe' : 'java'))
+        .find((path) => existsSync(path))
+      if (bundled !== undefined) return bundled
+    } catch {
+      // No embedded JRE; fall back to PATH below.
+    }
+    const pathHome = process.env.JAVA_HOME
+    if (pathHome !== undefined && pathHome !== '') {
+      const pathJava = join(pathHome, 'bin', process.platform === 'win32' ? 'java.exe' : 'java')
+      if (existsSync(pathJava)) return pathJava
+    }
+    return 'java'
+  }
+  const configured = process.env.DSH_JAVA_LS_HOME
+  if (configured !== undefined && configured !== '') candidates.push(configured)
+  candidates.push(join(homedir(), '.vscode', 'extensions'))
+  for (const candidate of candidates) {
+    let roots: string[]
+    try {
+      roots = candidate.endsWith('extensions')
+        ? readdirSync(candidate, { withFileTypes: true }).filter((entry) => entry.isDirectory() && entry.name.startsWith('redhat.java-')).map((entry) => join(candidate, entry.name)).sort().reverse()
+        : [candidate]
+    } catch {
+      continue
+    }
+    for (const extensionRoot of roots) {
+      const directConfig = join(extensionRoot, 'config_win')
+      const directPlugins = join(extensionRoot, 'plugins')
+      const serverRoot = existsSync(directConfig) && existsSync(directPlugins)
+        ? extensionRoot
+        : extensionRoot.endsWith('server') ? extensionRoot : join(extensionRoot, 'server')
+      const config = join(serverRoot, 'config_win')
+      const plugins = join(serverRoot, 'plugins')
+      if (!existsSync(config) || !existsSync(plugins)) continue
+      let launcherEntries
+      try {
+        launcherEntries = readdirSync(plugins, { withFileTypes: true })
+      } catch {
+        continue
+      }
+      const launcher = launcherEntries
+        .find((entry) => entry.isFile() && /^org\.eclipse\.equinox\.launcher_[^/]+\.jar$/.test(entry.name))
+      if (launcher === undefined) continue
+      const java = javaFor(extensionRoot.endsWith('server') ? extensionRoot.slice(0, -'server'.length) : extensionRoot)
+      const launcherJar = join(serverRoot, 'plugins', launcher.name)
+      return {
+        command: java,
+        args: (root) => [
+          '-Declipse.application=org.eclipse.jdt.ls.core.id1',
+          '-Dosgi.bundles.defaultStartLevel=4',
+          '-Declipse.product=org.eclipse.jdt.ls.core.product',
+          '-Dlog.protocol=true', '-Dlog.level=ERROR',
+          '--add-modules=ALL-SYSTEM',
+          '--add-opens', 'java.base/java.util=ALL-UNNAMED',
+          '--add-opens', 'java.base/java.lang=ALL-UNNAMED',
+          '-Xms256m', '-jar', launcherJar,
+          '-configuration', config,
+          '-data', join(tmpdir(), 'dsh-ide-jdtls', createHash('sha1').update(root).digest('hex').slice(0, 16)),
+        ],
+      }
+    }
+  }
+  return null
+}
+
+/**
+ * - ts / py：Node 语言服务器（`process.execPath` 以 Node 模式跑 JS 入口，--stdio）。
+ * - ps：PowerShell Editor Services 不是 Node 程序，用 `pwsh` 跑 vendor/ 中的脚本。
+ * - java：Eclipse JDT Language Server（可选，见 findJavaLauncher）。
+ */
+const SERVER_LAUNCHERS: Record<string, ServerLauncher> = (() => {
   const require = createRequire(import.meta.url)
   const tsEntry = require.resolve('typescript-language-server/lib/cli.mjs')
   const pyEntry = require.resolve('pyright/langserver.index.js')
   const psBundle = fileURLToPath(new URL('../vendor', import.meta.url))
-  return {
+  const base: Record<string, ServerLauncher> = {
     ts: { command: process.execPath, args: () => [tsEntry, '--stdio'] },
     py: { command: process.execPath, args: () => [pyEntry, '--stdio'] },
     ps: {
@@ -52,6 +131,9 @@ const SERVER_LAUNCHERS: Record<string, { command: string; args: () => string[] }
       ],
     },
   }
+  const java = findJavaLauncher()
+  if (java !== null) base.java = java
+  return base
 })()
 
 /** The server kind for a file path (or null when unsupported). */
@@ -60,6 +142,7 @@ export function lspServerForPath(path: string): string | null {
   if (language === null) return null
   if (language === 'python') return 'py'
   if (language === 'powershell') return 'ps'
+  if (language === 'java') return 'java'
   return 'ts'
 }
 
@@ -68,17 +151,23 @@ const LSP_MAX_CONNECTIONS = 8
 const LSP_MAX_FRAME_BYTES = 4 * 1024 * 1024
 let lspActiveCount = 0
 
-/** Accumulate stdin chunks and split on Content-Length framing. */
-class FrameReader {
+/** Accumulate stdin chunks and split on Content-Length framing.
+ *  push 返回 false 表示单帧超过上限（协议违规），调用方应断开连接。 */
+export class FrameReader {
   private buffer = Buffer.alloc(0)
   private contentLength: number | null = null
+  private readonly maxFrameBytes: number
 
-  push(chunk: Buffer, onMessage: (message: unknown) => void): void {
+  constructor(maxFrameBytes = LSP_MAX_FRAME_BYTES) {
+    this.maxFrameBytes = maxFrameBytes
+  }
+
+  push(chunk: Buffer, onMessage: (message: unknown) => void): boolean {
     this.buffer = Buffer.concat([this.buffer, chunk])
     for (;;) {
       if (this.contentLength === null) {
         const headEnd = this.buffer.indexOf('\r\n\r\n')
-        if (headEnd === -1) return
+        if (headEnd === -1) return true
         const header = this.buffer.subarray(0, headEnd).toString('utf8')
         const match = /Content-Length:\s*(\d+)/i.exec(header)
         if (match === null) {
@@ -87,9 +176,10 @@ class FrameReader {
           continue
         }
         this.contentLength = Number.parseInt(match[1], 10)
+        if (this.contentLength > this.maxFrameBytes) return false
         this.buffer = this.buffer.subarray(headEnd + 4)
       }
-      if (this.buffer.length < this.contentLength) return
+      if (this.buffer.length < this.contentLength) return true
       const body = this.buffer.subarray(0, this.contentLength).toString('utf8')
       this.buffer = this.buffer.subarray(this.contentLength)
       this.contentLength = null
@@ -112,6 +202,33 @@ interface Bridge {
   stderrTail: string
 }
 
+/** 校验 URI 是否位于授权工作区内：URI 与前缀都先做百分号解码（客户端 pathToUri
+ *  会编码空格/#/%/非 ASCII），再做大小写不敏感比较；要求目录段边界（/project
+ *  不能匹配 /project2），根自身（/project）放行。 */
+export function uriWithinRoot(uri: string, rootUriPrefix: string): boolean {
+  const decode = (value: string): string => {
+    try {
+      return decodeURIComponent(value)
+    } catch {
+      return value
+    }
+  }
+  const norm = decode(uri).toLowerCase()
+  const prefix = decode(rootUriPrefix).toLowerCase()
+  return norm === prefix || norm.startsWith(prefix.endsWith('/') ? prefix : `${prefix}/`)
+}
+
+function uriPrefixFor(root: string): string {
+  // 与客户端 pathToUri 保持同一编码规则：盘符保留，其余段百分号编码。
+  const encoded = root
+    .replaceAll('\\', '/')
+    .split('/')
+    .map((segment, index) => (index === 0 && /^[a-zA-Z]:$/.test(segment) ? segment : encodeURIComponent(segment)))
+    .join('/')
+    .replace(/\/+$/, '')
+  return 'file:///' + encoded
+}
+
 /**
  * Spawn the language server for a root and wire it to the socket.
  * @param ws - the WebSocket carrying LSP JSON-RPC frames from the browser.
@@ -128,7 +245,9 @@ export function attachLspSocket(fs: FsService, req: IncomingMessage, ws: WebSock
       const server = url.searchParams.get('server') ?? 'ts'
       const launcher = SERVER_LAUNCHERS[server]
       if (launcher === undefined) {
-        ws.close(1008, `unsupported server kind: ${server}`)
+        ws.close(server === 'java' ? 1011 : 1008, server === 'java'
+          ? 'Java LSP unavailable: install JDTLS or set DSH_JAVA_LS_HOME'
+          : `unsupported server kind: ${server}`)
         return
       }
       const gated = await fs.verify(root)
@@ -143,7 +262,7 @@ export function attachLspSocket(fs: FsService, req: IncomingMessage, ws: WebSock
       }
       lspActiveCount += 1
       const bridge: Bridge = {
-        child: spawn(launcher.command, launcher.args(), {
+        child: spawn(launcher.command, launcher.args(gated.canonical), {
           cwd: gated.canonical,
           // DSH Desktop 是 Electron 宿主：process.execPath 指向 DSH Desktop.exe，
           // 不设 ELECTRON_RUN_AS_NODE 会以 Electron GUI 模式启动脚本 → 立即退出。
@@ -190,21 +309,22 @@ export function attachLspSocket(fs: FsService, req: IncomingMessage, ws: WebSock
         }
       })
       bridge.child.stdout.on('data', (chunk: Buffer) => {
-        bridge.reader.push(chunk, (message) => {
+        const ok = bridge.reader.push(chunk, (message) => {
           if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(message))
         })
+        if (!ok && ws.readyState === WebSocket.OPEN) {
+          // 服务器回传帧超过上限：视为协议违规，断开连接并终止子进程。
+          closeWs(ws, 1009, 'server frame too large')
+          bridge.exited = true
+          try { bridge.child.kill() } catch { /* Already gone. */ }
+        }
       })
       // P1-03：URI 门禁——LSP 请求中的文件 URI 必须位于授权工作区内，
       // 防止语言服务器读取/索引工作区外的文件（Windows 大小写不敏感）。
-      // 路径 → file:// URI：保留盘符冒号（E:/work → e:/work），小写化便于比较。
-      const rootUriPrefix = 'file:///' + gated.canonical
-        .replaceAll('\\', '/')
-        .replace(/^([a-zA-Z]):/, (_m, drive: string) => `${drive.toLowerCase()}:`)
-        .replace(/\/+$/, '')
+      const rootUriPrefix = uriPrefixFor(gated.canonical)
       const uriAllowed = (uri: unknown): boolean => {
         if (typeof uri !== 'string') return true
-        const norm = decodeURIComponent(uri).toLowerCase()
-        return norm.startsWith(rootUriPrefix.toLowerCase())
+        return uriWithinRoot(uri, rootUriPrefix)
       }
       ws.on('message', (data) => {
         if (bridge.exited || bridge.child.stdin === null) return

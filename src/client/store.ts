@@ -34,6 +34,10 @@ export interface EditorTab {
   savedMtime?: number
   /** 文件过大被截断（>500K 字符）：只读，禁止保存（P1-04）。 */
   truncated?: boolean
+  /** 文件类型：text（默认）| image（位图预览，只读）。 */
+  kind?: 'text' | 'image'
+  /** 文本编码（host 实际使用的解码/写入编码，如 utf-8 / gb18030）；图片 tab 无。 */
+  encoding?: string
 }
 
 export interface IdeState {

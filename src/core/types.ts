@@ -20,6 +20,17 @@ export interface FileRead {
   truncated: boolean
   size: number
   mtime: number
+  /** 实际使用的解码编码（'auto' 请求时返回检测结果；默认 'utf-8'）。 */
+  encoding: string
+}
+
+/** 二进制图片读取结果（base64 + MIME，供编辑器图片预览）。 */
+export interface FileReadBinary {
+  /** base64 编码的图片字节。 */
+  data: string
+  mime: string
+  size: number
+  mtime: number
 }
 
 export interface PanelError {
@@ -49,6 +60,7 @@ export function languageIdForPath(path: string): string | null {
     case 'json': case 'jsonc': case 'map': return 'json'
     case 'py': case 'pyw': return 'python'
     case 'ps1': case 'psm1': case 'psd1': return 'powershell'
+    case 'java': return 'java'
     default: return null
   }
 }

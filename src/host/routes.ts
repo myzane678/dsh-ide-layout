@@ -7,10 +7,13 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { spawn } from 'node:child_process'
-import { dirname, relative } from 'node:path'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { basename, dirname, join, relative } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { PanelError } from '../core/types.ts'
+import { isTextEncodingId } from '../core/encoding.ts'
 import type { FsService } from './fs-service.ts'
 import * as git from './git.ts'
 import { isLoopbackRequest } from './security.ts'
@@ -36,6 +39,63 @@ function runCommandFor(path: string): string[] | null {
   if (ext === 'py') return ['python']
   if (ext === 'ps1') return ['pwsh', '-File']
   return null
+}
+
+interface ProcessResult {
+  error?: string
+  code?: number | null
+  signal?: string | null
+  timedOut: boolean
+}
+
+/** 在宿主侧执行一个受限子进程；Java 编译和运行共用同一套超时/输出上限。 */
+function runProcess(
+  command: string,
+  args: string[],
+  cwd: string,
+  appendChunk: (target: 'out' | 'err', chunk: Buffer) => void,
+): Promise<ProcessResult> {
+  return new Promise((done) => {
+    let timedOut = false
+    let settled = false
+    const child = spawn(command, args, {
+      cwd,
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+      windowsHide: true,
+    })
+    child.stdout?.on('data', (chunk: Buffer) => appendChunk('out', chunk))
+    child.stderr?.on('data', (chunk: Buffer) => appendChunk('err', chunk))
+    const timer = setTimeout(() => {
+      timedOut = true
+      child.kill()
+    }, RUN_TIMEOUT_MS)
+    const finish = (result: Omit<ProcessResult, 'timedOut'>): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      done({ ...result, timedOut })
+    }
+    child.on('error', (error) => finish({ error: error.message }))
+    child.on('close', (code, signal) => finish({ code, signal }))
+  })
+}
+
+/** Java 单文件入口：只支持一个源文件，编译产物写入系统临时目录，不污染工作区。 */
+async function javaSingleFileCommand(abs: string): Promise<{
+  outputDir: string
+  mainClass: string
+} | { error: string }> {
+  let source: string
+  try {
+    source = await readFile(abs, 'utf8')
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error) }
+  }
+  const packageMatch = /^\s*package\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*;/m.exec(source)
+  const className = basename(abs).replace(/\.java$/i, '')
+  const packageName = packageMatch?.[1]
+  const outputDir = await mkdtemp(join(tmpdir(), 'dsh-ide-java-'))
+  return { outputDir, mainClass: packageName === undefined ? className : `${packageName}.${className}` }
 }
 
 /** SSE keep-alive comment interval (proxies drop idle connections). */
@@ -189,8 +249,23 @@ export function registerPanelRoutes(ctx: Context, fs: FsService): () => void {
           json(res, FAIL(BAD_REQUEST))
           return
         }
-        const result = await fs.read(root, path)
+        const encodingRaw = strOrEmpty(payload, 'encoding') ?? 'utf-8'
+        if (encodingRaw !== 'auto' && !isTextEncodingId(encodingRaw)) {
+          json(res, FAIL({ code: 'encoding-unsupported', message: `不支持的编码: ${encodingRaw}` }))
+          return
+        }
+        const result = await fs.read(root, path, encodingRaw)
         json(res, 'content' in result ? OK(result) : FAIL(result))
+        return
+      }
+      case '/dsh-ide/read-binary': {
+        const path = strField(payload, 'path')
+        if (path === null) {
+          json(res, FAIL(BAD_REQUEST))
+          return
+        }
+        const result = await fs.readBinary(root, path)
+        json(res, 'data' in result ? OK(result) : FAIL(result))
         return
       }
       case '/dsh-ide/write': {
@@ -204,7 +279,12 @@ export function registerPanelRoutes(ctx: Context, fs: FsService): () => void {
           ? (payload as Record<string, unknown>).baseMtime
           : undefined
         const baseMtime = typeof rawBase === 'number' && Number.isFinite(rawBase) ? rawBase : undefined
-        const result = await fs.write(root, path, content, baseMtime)
+        const encodingRaw = strOrEmpty(payload, 'encoding') ?? 'utf-8'
+        if (!isTextEncodingId(encodingRaw)) {
+          json(res, FAIL({ code: 'encoding-unsupported', message: `不支持的编码: ${encodingRaw}` }))
+          return
+        }
+        const result = await fs.write(root, path, content, baseMtime, encodingRaw)
         json(res, 'mtime' in result ? OK(result) : FAIL(result))
         return
       }
@@ -267,9 +347,10 @@ export function registerPanelRoutes(ctx: Context, fs: FsService): () => void {
           json(res, FAIL(resolved))
           return
         }
+        const isJava = (path.split('.').pop() ?? '').toLowerCase() === 'java'
         const command = runCommandFor(path)
-        if (command === null) {
-          json(res, FAIL({ code: 'unsupported', message: `不支持运行 .${(path.split('.').pop() ?? '')} 文件（支持 js/ts/py/ps1）` }))
+        if (command === null && !isJava) {
+          json(res, FAIL({ code: 'unsupported', message: `不支持运行 .${(path.split('.').pop() ?? '')} 文件（支持 js/ts/py/ps1/java）` }))
           return
         }
         // P1-02：并发上限——同时运行太多脚本会耗尽宿主资源。
@@ -296,25 +377,57 @@ export function registerPanelRoutes(ctx: Context, fs: FsService): () => void {
             else { stderr = current.slice(0, RUN_OUTPUT_CAP); stderrTruncated = true }
           }
         }
-        const child = spawn(command[0], [...command.slice(1), resolved.abs], {
-          cwd: dirname(resolved.abs),
-          // DSH Desktop 是 Electron 宿主：process.execPath 指向 DSH Desktop.exe，
-          // 不加 ELECTRON_RUN_AS_NODE 会以 Electron GUI 模式启动脚本 → 立即退出。
-          // 该变量让 exe 以 Node 模式运行（对普通 Node 宿主无害）。
-          env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
-          windowsHide: true,
-        })
-        child.stdout?.on('data', (chunk: Buffer) => appendChunk('out', chunk))
-        child.stderr?.on('data', (chunk: Buffer) => appendChunk('err', chunk))
-        const timer = setTimeout(() => {
-          timedOut = true
-          child.kill()
-        }, RUN_TIMEOUT_MS)
-        const settled = await new Promise<{ error?: string; code?: number | null; signal?: string | null }>((done) => {
-          child.on('error', (error) => done({ error: error.message }))
-          child.on('close', (code, signal) => done({ code, signal }))
-        })
-        clearTimeout(timer)
+        let settled: ProcessResult = { timedOut: false }
+        let javaOutputDir: string | undefined
+        if (isJava) {
+          const java = await javaSingleFileCommand(resolved.abs)
+          if ('error' in java) {
+            runActiveCount = Math.max(0, runActiveCount - 1)
+            json(res, FAIL({ code: 'java-prepare-failed', message: `无法准备 Java 文件: ${java.error}` }))
+            return
+          }
+          javaOutputDir = java.outputDir
+          const compile = await runProcess('javac', ['-encoding', 'UTF-8', '-d', java.outputDir, resolved.abs], dirname(resolved.abs), appendChunk)
+          if (compile.error !== undefined || compile.code !== 0 || compile.signal !== null || compile.timedOut) {
+            settled = compile
+            timedOut = compile.timedOut
+          } else {
+            settled = await runProcess('java', [
+              '-Dfile.encoding=UTF-8',
+              '-Dsun.stdout.encoding=UTF-8',
+              '-Dsun.stderr.encoding=UTF-8',
+              '-cp', java.outputDir, java.mainClass,
+            ], dirname(resolved.abs), appendChunk)
+            timedOut = settled.timedOut
+          }
+        } else if (command !== null) {
+          const child = spawn(command[0], [...command.slice(1), resolved.abs], {
+            cwd: dirname(resolved.abs),
+            // DSH Desktop 是 Electron 宿主：process.execPath 指向 DSH Desktop.exe，
+            // 不加 ELECTRON_RUN_AS_NODE 会以 Electron GUI 模式启动脚本 → 立即退出。
+            // 该变量让 exe 以 Node 模式运行（对普通 Node 宿主无害）。
+            env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+            windowsHide: true,
+          })
+          child.stdout?.on('data', (chunk: Buffer) => appendChunk('out', chunk))
+          child.stderr?.on('data', (chunk: Buffer) => appendChunk('err', chunk))
+          const timer = setTimeout(() => {
+            timedOut = true
+            child.kill()
+          }, RUN_TIMEOUT_MS)
+          settled = await new Promise<ProcessResult>((done) => {
+            child.on('error', (error) => done({ error: error.message, timedOut }))
+            child.on('close', (code, signal) => done({ code, signal, timedOut }))
+          })
+          clearTimeout(timer)
+        }
+        if (javaOutputDir !== undefined) {
+          try {
+            await rm(javaOutputDir, { recursive: true, force: true })
+          } catch {
+            // 临时目录清理失败不影响运行结果。
+          }
+        }
         runActiveCount = Math.max(0, runActiveCount - 1)
         if (settled.error !== undefined) {
           json(res, FAIL({ code: 'spawn-failed', message: `无法启动解释器: ${settled.error}` }))

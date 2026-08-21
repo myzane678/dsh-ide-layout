@@ -11,6 +11,9 @@ importers:
       '@codemirror/autocomplete':
         specifier: ^6.20.3
         version: 6.20.3
+      '@codemirror/commands':
+        specifier: ^6.11.0
+        version: 6.11.0
       '@codemirror/lang-cpp':
         specifier: ^6.0.3
         version: 6.0.3
@@ -92,6 +95,9 @@ importers:
       codemirror:
         specifier: ^6.0.1
         version: 6.0.2
+      iconv-lite:
+        specifier: ^0.7.3
+        version: 0.7.3
       node-pty:
         specifier: ^1.1.0
         version: 1.1.0
@@ -197,6 +203,9 @@ packages:
 
   '@codemirror/commands@6.10.4':
     resolution: {integrity: sha512-Ryk9y9T0FFVF0cUGhAknveAyUOl/A1qReTFi+qPKtOh2Z9F4AUBz3XOrYD4ZEgZirdugVzHvd/2/Wcwy5OliTg==}
+
+  '@codemirror/commands@6.11.0':
+    resolution: {integrity: sha512-/K4Rl5BN0OtTiPWmJCdqODu38XnDMsDxKY5rgrPnCkutPTJf2wVbkoixLfealF5Kwse/s8P8M5jAiURiwSwnFA==}
 
   '@codemirror/lang-cpp@6.0.3':
     resolution: {integrity: sha512-URM26M3vunFFn9/sm6rzqrBzDgfWuDixp85uTY49wKudToc2jTHUrKIGGKs+QWND+YLofNNZpxcNGRynFJfvgA==}
@@ -1446,6 +1455,10 @@ packages:
   html-void-elements@3.0.0:
     resolution: {integrity: sha512-bEqo66MRXsUGxWHV5IP0PUiAWwoEjba4VCzg0LjFJBpchPaTfyfCKTG6bc5F8ucKec3q5y6qOdGyYTSBEvhCrg==}
 
+  iconv-lite@0.7.3:
+    resolution: {integrity: sha512-IKXpvIzjnC9XTAUbVBcMfGS0EPaIXtW6v+zr+RRp+hqULEpo0owZax6wyRwPOJbWbzjYspQwusTsfVr0ifh4uQ==}
+    engines: {node: '>=0.10.0'}
+
   immer@10.1.1:
     resolution: {integrity: sha512-s2MPrmjovJcoMaHtx6K11Ra7oD05NT97w1IC5zpMkT6Atjr7H8LjaDd81iIxUYpMKSRRNMJE703M1Fhr/TctHw==}
 
@@ -1804,6 +1817,9 @@ packages:
     engines: {node: ^20.19.0 || >=22.12.0}
     hasBin: true
 
+  safer-buffer@2.1.2:
+    resolution: {integrity: sha512-YZo3K82SD7Riyi0E1EQPojLz7kpepnSQI9IyPbHHg1XXXevb5dJI7tpyN2ADxGcQbHG7vcyRHk0cbwqcQriUtg==}
+
   scheduler@0.23.2:
     resolution: {integrity: sha512-UOShsPwz7NrMUqhR6t0hWjFduvOzbtv7toDH1/hIrfRNIDBnnBWd0CwJTGvTpngVlmwGCdP9/Zl/tVrDqcuYzQ==}
 
@@ -2135,6 +2151,13 @@ snapshots:
       '@lezer/common': 1.5.2
 
   '@codemirror/commands@6.10.4':
+    dependencies:
+      '@codemirror/language': 6.12.4
+      '@codemirror/state': 6.7.1
+      '@codemirror/view': 6.43.8
+      '@lezer/common': 1.5.2
+
+  '@codemirror/commands@6.11.0':
     dependencies:
       '@codemirror/language': 6.12.4
       '@codemirror/state': 6.7.1
@@ -3521,6 +3544,10 @@ snapshots:
 
   html-void-elements@3.0.0: {}
 
+  iconv-lite@0.7.3:
+    dependencies:
+      safer-buffer: 2.1.2
+
   immer@10.1.1: {}
 
   import-without-cache@0.4.0: {}
@@ -4050,6 +4077,8 @@ snapshots:
       '@rolldown/binding-openharmony-arm64': 1.2.4
       '@rolldown/binding-win32-arm64-msvc': 1.2.4
       '@rolldown/binding-win32-x64-msvc': 1.2.4
+
+  safer-buffer@2.1.2: {}
 
   scheduler@0.23.2:
     dependencies:

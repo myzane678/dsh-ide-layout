@@ -39,7 +39,39 @@ export interface LspCompletionItem {
   insertText?: string
   insertTextFormat?: number
   textEdit?: { range: LspRange; newText: string }
+  additionalTextEdits?: LspTextEdit[]
+  commitCharacters?: string[]
+  filterText?: string
   sortText?: string
+}
+
+export type LspSignatureParameter = {
+  label: string | [number, number]
+  documentation?: string | { kind: string; value: string }
+}
+
+export type LspSignatureInformation = {
+  label: string
+  documentation?: string | { kind: string; value: string }
+  parameters?: LspSignatureParameter[]
+  activeParameter?: number
+}
+
+export type LspSignatureHelp = {
+  signatures: LspSignatureInformation[]
+  activeSignature?: number
+  activeParameter?: number
+}
+
+export function signatureParameterRange(help: LspSignatureHelp): { label: string; activeFrom: number; activeTo: number } | null {
+  const signature = help.signatures[help.activeSignature ?? 0]
+  if (signature === undefined) return null
+  const active = help.activeParameter ?? signature.activeParameter ?? 0
+  const parameter = signature.parameters?.[active]
+  if (parameter === undefined) return { label: signature.label, activeFrom: -1, activeTo: -1 }
+  if (Array.isArray(parameter.label)) return { label: signature.label, activeFrom: parameter.label[0], activeTo: parameter.label[1] }
+  const start = signature.label.indexOf(parameter.label)
+  return { label: signature.label, activeFrom: start, activeTo: start >= 0 ? start + parameter.label.length : -1 }
 }
 
 export interface LspDiagnostic {
@@ -98,10 +130,16 @@ export interface LspCodeAction {
 /** Diagnostic severities (LSP: 1=Error, 2=Warning, 3=Information, 4=Hint). */
 export const LSP_SEVERITY = { Error: 1, Warning: 2, Information: 3, Hint: 4 } as const
 
-/** Path → file:// URI (Windows paths backslash-normalised). */
+/** Path → file:// URI (Windows paths backslash-normalised).
+ *  特殊字符（空格、#、%、非 ASCII 等）按 UTF-8 百分号编码，Windows 盘符冒号保留。 */
 export function pathToUri(root: string, path: string): string {
   const joined = `${root.replaceAll('\\', '/')}/${path.replaceAll('\\', '/')}`
-  return `file:///${joined}`
+  const encoded = joined.split('/').map((segment, index) => {
+    // 首段若为 Windows 盘符（E:）原样保留；其余段做百分号编码。
+    if (index === 0 && /^[a-zA-Z]:$/.test(segment)) return segment
+    return encodeURIComponent(segment)
+  }).join('/')
+  return `file:///${encoded}`
 }
 
 /** 归一化 URI 用于匹配（Windows：盘符大小写 + 百分号编码冒号）。 */
@@ -137,6 +175,29 @@ export function completionInfo(documentation?: string | { kind: string; value: s
   return typeof documentation === 'string' ? documentation : documentation.value
 }
 
+/** Convert an LSP UTF-16 position to a JavaScript string offset. */
+export function lspPositionToOffset(text: string, position: LspPosition): number {
+  const lines = text.split('\n')
+  if (position.line < 0 || position.line >= lines.length) return text.length
+  let offset = 0
+  for (let index = 0; index < position.line; index++) offset += lines[index]!.length + 1
+  return offset + Math.min(Math.max(position.character, 0), lines[position.line]!.length)
+}
+
+/** Prefer the range supplied by LSP, falling back to the editor's word range. */
+export function completionTextRange(
+  item: LspCompletionItem,
+  text: string,
+  fallback: { from: number; to: number },
+): { from: number; to: number } {
+  const range = item.textEdit?.range
+  if (range === undefined) return fallback
+  return {
+    from: lspPositionToOffset(text, range.start),
+    to: lspPositionToOffset(text, range.end),
+  }
+}
+
 /** JSON-RPC message envelope over the wire. */
 type RpcMessage =
   | { jsonrpc: '2.0'; id: number; method: string; params?: unknown }
@@ -152,8 +213,8 @@ export interface LspClientOptions {
   root: string
   /** The file:// URI the server should treat as the workspace root. */
   rootUri: string
-  /** 语言服务器类型：'ts'（typescript-language-server）/ 'py'（pyright）/ 'ps'（PowerShell Editor Services）。 */
-  server?: 'ts' | 'py' | 'ps'
+  /** 语言服务器类型：ts / py / ps / java（Eclipse JDT Language Server）。 */
+  server?: 'ts' | 'py' | 'ps' | 'java'
   /** 诊断回调：uri 已归一化（与 pathToUri 输出一致，Windows 盘符小写化）。 */
   onDiagnostics: (uri: string, diagnostics: LspDiagnostic[]) => void
   /** 服务器主动日志（window/logMessage，如退出时的完整 stderr）。type: 3=Error。 */
@@ -225,15 +286,38 @@ export class LspClient {
   async completion(path: string, position: LspPosition): Promise<LspCompletionItem[] | null> {
     const doc = this.docs.get(path)
     if (doc === undefined || !this.initialized || !this.isOpen) return null
-    const result = await this.request('textDocument/completion', {
-      textDocument: { uri: doc.uri },
-      position,
-    })
+    let result: unknown
+    try {
+      result = await this.request('textDocument/completion', {
+        textDocument: { uri: doc.uri },
+        position,
+        context: { triggerKind: 1 },
+      })
+    } catch {
+      return null
+    }
     if (result === null) return null
     // LSP: CompletionList | CompletionItem[] | null.
     if (Array.isArray(result)) return result as LspCompletionItem[]
     const list = result as { items?: LspCompletionItem[] }
     return list.items ?? null
+  }
+
+  /** Request the active function signature for a position. */
+  async signatureHelp(path: string, position: LspPosition): Promise<LspSignatureHelp | null> {
+    const doc = this.docs.get(path)
+    if (doc === undefined || !this.initialized || !this.isOpen) return null
+    try {
+      const result = await this.request('textDocument/signatureHelp', {
+        textDocument: { uri: doc.uri },
+        position,
+        context: { triggerKind: 1 },
+      })
+      if (result === null || typeof result !== 'object') return null
+      return result as LspSignatureHelp
+    } catch {
+      return null
+    }
   }
 
   /** LSP hover result: { value } | { kind, value }[] | string | null. */
@@ -459,10 +543,13 @@ export class LspClient {
    *  tsserver 不关心这些配置，返回 null 即可。 */
   private configFor(section: string | undefined): unknown {
     if (this.options.server === 'py' && section === 'pyright') {
-      return { strict: false, useLibraryCodeForTypes: false }
+      // useLibraryCodeForTypes:false = 第三方库按 Any 处理（Pylance 默认行为），
+      // 避免 mne/scipy 等类型标注差的库产生大量误报；补全仍由模块符号表提供，
+      // autoImportCompletions 保持开启。
+      return { strict: false, useLibraryCodeForTypes: false, autoImportCompletions: true }
     }
     if (this.options.server === 'py' && section === 'python') {
-      return { analysis: { typeCheckingMode: 'basic', useLibraryCodeForTypes: false } }
+      return { analysis: { typeCheckingMode: 'basic', useLibraryCodeForTypes: false, autoImportCompletions: true } }
     }
     return null
   }
@@ -478,7 +565,7 @@ export class LspClient {
         capabilities: {
           textDocument: {
             synchronization: { didSave: false },
-            completion: { completionItem: { snippetSupport: false } },
+            completion: { completionItem: { snippetSupport: true } },
             publishDiagnostics: {},
           },
           workspace: { configuration: true },
@@ -488,7 +575,7 @@ export class LspClient {
       // 主动推送宽松配置（某些服务器只认 didChangeConfiguration，不等 configuration 请求）。
       if (this.options.server === 'py') {
         this.notify('workspace/didChangeConfiguration', {
-          settings: { pyright: { strict: false, useLibraryCodeForTypes: false } },
+          settings: { pyright: { strict: false, useLibraryCodeForTypes: false, autoImportCompletions: true } },
         })
       }
       this.initialized = true

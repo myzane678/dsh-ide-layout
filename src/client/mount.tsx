@@ -204,6 +204,10 @@ function Workbench({ api }: { api: IdeMountApi }): JSX.Element {
             ...prev,
             diagnostics: { ...prev.diagnostics, [uri]: diagnostics },
           }))}
+          onReloadTab={(tab) => api.ide.update((prev) => ({
+            ...prev,
+            tabs: prev.tabs.map((item) => item.id === tab.id ? tab : item),
+          }))}
         />
       </div>
     </div>
